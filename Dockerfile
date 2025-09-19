@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # --- Build stage ---
-FROM rust:slim-bookworm as builder
+FROM rust:slim-bookworm AS builder
 WORKDIR /app
 
 # System deps for linking (OpenSSL) and pkg-config
@@ -9,8 +9,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev ca-certificates build-essential && \
     rm -rf /var/lib/apt/lists/*
 
-# Cache dependencies
-COPY Cargo.toml Cargo.lock ./
+# Cache dependencies (copy manifest(s), lockfile if present)
+COPY Cargo.* ./
 RUN mkdir -p src && echo "fn main(){}" > src/main.rs
 RUN cargo build --release --features mcp || true
 
