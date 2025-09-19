@@ -111,6 +111,65 @@ Pull the image from GHCR:
 docker pull ghcr.io/anthony-cervantes/scylla-rust-mcp:latest
 ```
 
+### JSON Examples (Claude Desktop and other MCP clients)
+
+Claude Desktop and many MCP clients use a JSON configuration with an `mcpServers` object. Below are sanitized JSON examples mirroring the Docker/TLS cases above.
+
+Plaintext (localhost):
+```json
+{
+  "mcpServers": {
+    "scylla-rust-mcp": {
+      "command": "docker",
+      "args": [
+        "run","--rm","-i",
+        "-e","SCYLLA_URI=host.docker.internal:9042",
+        "ghcr.io/anthony-cervantes/scylla-rust-mcp:latest"
+      ]
+    }
+  }
+}
+```
+
+TLS (insecure) with auth (placeholders):
+```json
+{
+  "mcpServers": {
+    "scylla-rust-mcp": {
+      "command": "docker",
+      "args": [
+        "run","--rm","-i",
+        "-e","SCYLLA_URI=scylla.example.com:9142",
+        "-e","SCYLLA_USER=scylla",
+        "-e","SCYLLA_PASS=secret",
+        "-e","SCYLLA_SSL=true",
+        "-e","SCYLLA_SSL_INSECURE=true",
+        "ghcr.io/anthony-cervantes/scylla-rust-mcp:latest"
+      ]
+    }
+  }
+}
+```
+
+TLS with custom CA bundle:
+```json
+{
+  "mcpServers": {
+    "scylla-rust-mcp": {
+      "command": "docker",
+      "args": [
+        "run","--rm","-i",
+        "-v","/absolute/path/ca.pem:/ca.pem:ro",
+        "-e","SCYLLA_URI=scylla.example.com:9142",
+        "-e","SCYLLA_SSL=true",
+        "-e","SCYLLA_CA_BUNDLE=/ca.pem",
+        "ghcr.io/anthony-cervantes/scylla-rust-mcp:latest"
+      ]
+    }
+  }
+}
+```
+
 ## Local Development
 
 Prerequisites
