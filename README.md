@@ -64,43 +64,51 @@ Linux note: `host.docker.internal` may not resolve; use your host IP or mapped p
 
 ## Use With MCP Clients
 
-Stdio servers are commonly launched by an MCP client. Example configuration using Docker invocation (env is passed via `-e`):
+MCP clients (e.g., Codex) can launch the server via Docker. Below are sanitized examples using the Codex configuration style you provided, plus an example using the published GHCR image.
 
+Plaintext (localhost):
 ```toml
-[mcp.servers."scylla-rust-mcp"]
+[mcp_servers.scylla-rust-mcp]
 command = "docker"
 args = [
-  "run", "--rm", "-i",
-  "-e", "SCYLLA_URI=host.docker.internal:9042",
-  "scylla-rust-mcp:latest"
+  "run","--rm","-i",
+  "-e","SCYLLA_URI=host.docker.internal:9042",
+  "ghcr.io/anthony-cervantes/scylla-rust-mcp:latest"
 ]
 ```
 
-TLS + custom CA:
+TLS (insecure) with auth (placeholders):
 ```toml
-[mcp.servers."scylla-rust-mcp"]
+[mcp_servers.scylla-rust-mcp]
 command = "docker"
 args = [
-  "run", "--rm", "-i",
-  "-v", "/absolute/path/ca.pem:/ca.pem:ro",
-  "-e", "SCYLLA_URI=my-scylla.example.com:9142",
-  "-e", "SCYLLA_SSL=true",
-  "-e", "SCYLLA_CA_BUNDLE=/ca.pem",
-  "scylla-rust-mcp:latest"
+  "run","--rm","-i",
+  "-e","SCYLLA_URI=scylla.example.com:9142",
+  "-e","SCYLLA_USER=scylla",
+  "-e","SCYLLA_PASS=secret",
+  "-e","SCYLLA_SSL=true",
+  "-e","SCYLLA_SSL_INSECURE=true",
+  "ghcr.io/anthony-cervantes/scylla-rust-mcp:latest"
 ]
 ```
 
-Auth example:
+TLS with custom CA bundle:
 ```toml
-[mcp.servers."scylla-rust-mcp"]
+[mcp_servers.scylla-rust-mcp]
 command = "docker"
 args = [
-  "run", "--rm", "-i",
-  "-e", "SCYLLA_URI=my-scylla.example.com:9142",
-  "-e", "SCYLLA_USER=scylla",
-  "-e", "SCYLLA_PASS=secret",
-  "scylla-rust-mcp:latest"
+  "run","--rm","-i",
+  "-v","/absolute/path/ca.pem:/ca.pem:ro",
+  "-e","SCYLLA_URI=scylla.example.com:9142",
+  "-e","SCYLLA_SSL=true",
+  "-e","SCYLLA_CA_BUNDLE=/ca.pem",
+  "ghcr.io/anthony-cervantes/scylla-rust-mcp:latest"
 ]
+```
+
+Pull the image from GHCR:
+```bash
+docker pull ghcr.io/anthony-cervantes/scylla-rust-mcp:latest
 ```
 
 ## Local Development
@@ -141,4 +149,3 @@ This server is read-only by design. If you discover a security issue, please ope
 
 ## License
 Specify a license for this repository (e.g., Apache-2.0 or MIT). If you would like, we can add a `LICENSE` file and update this section.
-
