@@ -1,21 +1,36 @@
 # scylla-rust-mcp
 
-Read-only MCP (Model Context Protocol) server for ScyllaDB.
+Read-only MCP (Model Context Protocol) server for ScyllaDB that exposes safe data discovery and query tools over stdio for AI agents and MCP clients.
 
-This README focuses on two things:
-- How to configure and run the Docker image (recommended)
-- Minimal developer setup for local builds
+![CI](https://github.com/anthony-cervantes/scylla-rust-mcp/actions/workflows/ci.yml/badge.svg)
+![Release](https://github.com/anthony-cervantes/scylla-rust-mcp/actions/workflows/release.yml/badge.svg)
 
-## Docker Usage (Recommended)
+## Features
+- Read-only ScyllaDB access (no writes or schema changes)
+- TLS (OpenSSL) + optional username/password auth
+- Prepared statements for fast, safe queries
+- Pagination with cursors (`paged_select`)
+- Schema discovery (`search_schema`) and rich introspection tools
+- Shared connection/session and lightweight schema cache
 
-Build locally (optional):
+Supported tools (MCP):
+- `list_keyspaces`, `list_tables`, `describe_table`
+- `list_indexes`, `list_views`, `keyspace_replication`
+- `list_udts`, `list_functions`, `list_aggregates`
+- `cluster_topology`, `size_estimates`
+- `sample_rows`, `select`, `paged_select`, `partition_rows`
+- `search_schema`
 
+## Quick Start (Docker)
+
+Use the prebuilt image if available, or build locally.
+
+Build locally:
 ```bash
 docker build -t scylla-rust-mcp:latest .
 ```
 
-Run the server (stdio transport):
-
+Run (stdio transport):
 ```bash
 # Plaintext
 docker run --rm -i \
@@ -28,7 +43,7 @@ docker run --rm -i \
   -e SCYLLA_SSL=true \
   scylla-rust-mcp:latest
 
-# TLS + custom CA bundle
+# TLS + custom CA
 docker run --rm -i \
   -v /absolute/path/ca.pem:/ca.pem:ro \
   -e SCYLLA_URI=my-scylla.example.com:9142 \
@@ -37,19 +52,19 @@ docker run --rm -i \
   scylla-rust-mcp:latest
 ```
 
-Environment variables (inside the container):
-- `SCYLLA_URI` (required): `host:port` of Scylla/Cassandra endpoint
-- `SCYLLA_USER`, `SCYLLA_PASS` (optional): username/password auth
+Environment:
+- `SCYLLA_URI` (required): `host:port` for Scylla/Cassandra
+- `SCYLLA_USER`, `SCYLLA_PASS` (optional): credentials
 - `SCYLLA_SSL` (optional): `true`/`1` to enable TLS
-- `SCYLLA_CA_BUNDLE` (optional): absolute path to a CA bundle inside the container
-- `SCYLLA_SSL_INSECURE` (optional): `true`/`1` to skip certificate verification (lab only)
+- `SCYLLA_CA_BUNDLE` (optional): absolute path to CA bundle in the container
+- `SCYLLA_SSL_INSECURE` (optional): `true`/`1` to skip verification (dev only)
 - `RUST_LOG` (optional): log level, e.g. `info`, `debug`
 
-Codex TOML (Docker)
+Linux note: `host.docker.internal` may not resolve; use your host IP or mapped ports.
 
-When `command = "docker"`, the `env` table applies to the docker CLI, not the container. Pass container env with `-e` flags in `args`.
+## Use With MCP Clients
 
-Plaintext (macOS/Windows):
+Stdio servers are commonly launched by an MCP client. Example configuration using Docker invocation (env is passed via `-e`):
 
 ```toml
 [mcp.servers."scylla-rust-mcp"]
@@ -62,7 +77,6 @@ args = [
 ```
 
 TLS + custom CA:
-
 ```toml
 [mcp.servers."scylla-rust-mcp"]
 command = "docker"
@@ -77,7 +91,6 @@ args = [
 ```
 
 Auth example:
-
 ```toml
 [mcp.servers."scylla-rust-mcp"]
 command = "docker"
@@ -90,25 +103,42 @@ args = [
 ]
 ```
 
-Linux host networking notes
-- On Linux, `host.docker.internal` may not resolve; use the host IP (e.g., `192.168.x.x:9042`) or mapped ports.
+## Local Development
 
-## Dev Setup (Local)
-
-Prereqs
+Prerequisites
 - Rust stable (edition 2021)
-- OpenSSL headers for TLS (if using `SCYLLA_SSL=true`):
+- OpenSSL headers for TLS
   - macOS: `brew install openssl@3`
   - Debian/Ubuntu: `sudo apt-get install -y libssl-dev pkg-config`
 
-Run locally (stdio server):
-
+Build and run (stdio server):
 ```bash
 export SCYLLA_URI=127.0.0.1:9042
-cargo run --features mcp
+cargo run
 ```
 
 Quality checks
 - Format: `cargo fmt --all`
 - Lint: `cargo clippy --all-targets --all-features -- -D warnings`
-- Tests: `cargo test` (integration tests are `#[ignore]` unless `SCYLLA_URI` is set)
+- Tests: `cargo test` (some integration tests are `#[ignore]` unless `SCYLLA_URI` is set)
+
+## Roadmap
+- Partition reads: `partition_rows` (strict prepared PK binding)
+- Paged tests: add ignored integration tests for `paged_select` and `search_schema`
+- Schema validation: fail early on invalid column/filter/order_by
+- Observability: add row counts/durations to spans; optional metrics
+- CI: boot Scylla via Docker and run ignored integration tests
+
+## Contributing
+We welcome issues and PRs. Please:
+- Follow rustfmt defaults: `cargo fmt --all`
+- Lint cleanly: `cargo clippy --all-targets --all-features -- -D warnings`
+- Add tests where possible (unit in-file, integration under `tests/`)
+- Avoid committing secrets; use env vars
+
+## Security
+This server is read-only by design. If you discover a security issue, please open a private issue or contact the maintainer.
+
+## License
+Specify a license for this repository (e.g., Apache-2.0 or MIT). If you would like, we can add a `LICENSE` file and update this section.
+
