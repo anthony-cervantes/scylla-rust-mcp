@@ -148,4 +148,8 @@ We welcome issues and PRs. Please:
 This server is read-only by design. If you discover a security issue, please open a private issue or contact the maintainer.
 
 ## License
-Specify a license for this repository (e.g., Apache-2.0 or MIT). If you would like, we can add a `LICENSE` file and update this section.
+Licensed under either of
+- Apache License, Version 2.0 (see `LICENSE-APACHE`)
+- MIT License (see `LICENSE-MIT`)
+
+at your option.
