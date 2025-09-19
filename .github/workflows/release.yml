@@ -1,0 +1,84 @@
+name: Release
+
+on:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  bump-build-push:
+    name: Bump version, tag, build and push image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq git libssl-dev pkg-config
+
+      - name: Set up Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Determine and bump version (patch)
+        if: github.actor != 'github-actions[bot]'
+        id: bump
+        run: |
+          set -euo pipefail
+          CURRENT=$(grep -m1 '^version\s*=\s*"' Cargo.toml | sed -E 's/.*"([0-9]+\.[0-9]+\.[0-9]+)".*/\1/')
+          IFS='.' read -r MAJOR MINOR PATCH <<<"$CURRENT"
+          NEW_VER="$MAJOR.$MINOR.$((PATCH+1))"
+          echo "Current: $CURRENT -> New: $NEW_VER"
+          # Update Cargo.toml in-place (package.version)
+          sed -i -E "0,/^version\s*=\s*\"[0-9]+\.[0-9]+\.[0-9]+\"/s//version = \"$NEW_VER\"/" Cargo.toml
+          echo "version=$NEW_VER" >> $GITHUB_OUTPUT
+
+      - name: Commit and tag release
+        if: github.actor != 'github-actions[bot]'
+        env:
+          NEW_VER: ${{ steps.bump.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NEW_VER:-}" ]; then echo "No version bump (skipping)"; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml
+          git commit -m "chore(release): v${NEW_VER} [skip ci]"
+          git tag -a "v${NEW_VER}" -m "v${NEW_VER}"
+          git push --follow-tags
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image repository (lowercase)
+        id: img
+        run: echo "repo_lc=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU (multi-arch)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push multi-arch image (version + latest)
+        id: docker_build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: |
+            ghcr.io/${{ steps.img.outputs.repo_lc }}:${{ steps.bump.outputs.version || 'dev' }}
+            ghcr.io/${{ steps.img.outputs.repo_lc }}:latest

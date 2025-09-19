@@ -4,9 +4,6 @@
 FROM rust:slim-bookworm as builder
 WORKDIR /app
 
-# Install nightly toolchain for Rust edition 2024
-RUN rustup toolchain install nightly && rustup default nightly
-
 # System deps for linking (OpenSSL) and pkg-config
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev ca-certificates build-essential && \

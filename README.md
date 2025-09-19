@@ -96,9 +96,7 @@ Linux host networking notes
 ## Dev Setup (Local)
 
 Prereqs
-- Rust nightly (edition 2024):
-  - `rustup toolchain install nightly`
-  - in repo: `rustup override set nightly`
+- Rust stable (edition 2021)
 - OpenSSL headers for TLS (if using `SCYLLA_SSL=true`):
   - macOS: `brew install openssl@3`
   - Debian/Ubuntu: `sudo apt-get install -y libssl-dev pkg-config`
@@ -114,4 +112,3 @@ Quality checks
 - Format: `cargo fmt --all`
 - Lint: `cargo clippy --all-targets --all-features -- -D warnings`
 - Tests: `cargo test` (integration tests are `#[ignore]` unless `SCYLLA_URI` is set)
-

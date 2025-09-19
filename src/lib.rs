@@ -777,9 +777,8 @@ pub mod mcp {
                                 let allowed: std::collections::HashSet<String> =
                                     schema.clustering_keys.iter().cloned().collect();
                                 for item in arr.iter().filter_map(|v| v.as_object()) {
-                                    if let Some(col) = item.get("column").and_then(|v| v.as_str())
-                                        && !allowed.contains(col)
-                                    {
+                                    let Some(col) = item.get("column").and_then(|v| v.as_str()) else { continue; };
+                                    if !allowed.contains(col) {
                                         return Ok(rust_mcp_schema::CallToolResult::text_content(
                                             format!("invalid order_by column '{}'", col),
                                             None,
