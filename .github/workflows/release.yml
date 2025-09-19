@@ -31,13 +31,19 @@ jobs:
         id: bump
         run: |
           set -euo pipefail
+          # Read current version from Cargo.toml
           CURRENT=$(grep -m1 '^version\s*=\s*"' Cargo.toml | sed -E 's/.*"([0-9]+\.[0-9]+\.[0-9]+)".*/\1/')
-          IFS='.' read -r MAJOR MINOR PATCH <<<"$CURRENT"
+          # Find latest existing tag (vX.Y.Z), default 0.0.0 if none
+          LATEST_TAG=$(git tag -l 'v*' --sort=-v:refname | head -n1 | sed -E 's/^v//') || true
+          if [ -z "${LATEST_TAG:-}" ]; then LATEST_TAG="0.0.0"; fi
+          # Choose the greater of CURRENT and LATEST_TAG
+          BASE=$(printf "%s\n%s\n" "$CURRENT" "$LATEST_TAG" | sort -V | tail -n1)
+          IFS='.' read -r MAJOR MINOR PATCH <<<"$BASE"
           NEW_VER="$MAJOR.$MINOR.$((PATCH+1))"
-          echo "Current: $CURRENT -> New: $NEW_VER"
+          echo "Current: $CURRENT, Latest tag: v$LATEST_TAG -> New: $NEW_VER"
           # Update Cargo.toml in-place (package.version)
           sed -i -E "0,/^version\s*=\s*\"[0-9]+\.[0-9]+\.[0-9]+\"/s//version = \"$NEW_VER\"/" Cargo.toml
-          echo "version=$NEW_VER" >> $GITHUB_OUTPUT
+          echo "version=$NEW_VER" >> "$GITHUB_OUTPUT"
 
       - name: Commit and tag release
         if: github.actor != 'github-actions[bot]'
