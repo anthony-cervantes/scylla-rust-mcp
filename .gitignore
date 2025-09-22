@@ -1,0 +1,12 @@
+/target
+.aim/
+
+# Local environment files (never commit secrets)
+.env
+.env.*
+!.env.example
+
+# Common certificate/key file types (avoid accidental commits)
+*.pem
+*.crt
+*.key

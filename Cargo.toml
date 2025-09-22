@@ -1,0 +1,21 @@
+[package]
+name = "scylla-rust-mcp"
+version = "0.1.6"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std"] }
+tracing = { version = "0.1" }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1" }
+anyhow = { version = "1" }
+"rust-mcp-sdk" = { version = "0.1" }
+"rust-mcp-schema" = { version = "0.3" }
+scylla = { version = "0.14", features = ["ssl"] }
+futures = { version = "0.3" }
+async-trait = { version = "0.1" }
+base64 = { version = "0.22" }
+openssl = { version = "0.10" }
+scylla-cql = { version = "0.3" }
