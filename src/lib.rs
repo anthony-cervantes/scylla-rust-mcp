@@ -114,8 +114,11 @@ pub mod server {
 }
 
 pub mod mcp {
+    use anyhow::{Context, Result};
     use rust_mcp_sdk::error::SdkResult;
-    use tracing::{info, Level};
+    use std::sync::Arc;
+    use tokio::sync::OnceCell;
+    use tracing::{error, info, Level};
     use tracing_subscriber::EnvFilter;
 
     pub async fn run_stdio_server() -> SdkResult<()> {
@@ -147,55 +150,39 @@ pub mod mcp {
         };
 
         let transport = StdioTransport::new(TransportOptions::default())?;
-        // Shared Scylla session for handler state
-        let mut sb = scylla::SessionBuilder::new();
-        let uri = std::env::var("SCYLLA_URI").unwrap_or_else(|_| "127.0.0.1:9042".to_string());
-        sb = sb.known_node(uri);
-        if let (Ok(user), Ok(pass)) = (std::env::var("SCYLLA_USER"), std::env::var("SCYLLA_PASS")) {
-            sb = sb.user(user, pass);
-        }
-        if std::env::var("SCYLLA_SSL")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-        {
-            use openssl::ssl::{SslContext, SslMethod, SslVerifyMode};
-            let mut ctx = SslContext::builder(SslMethod::tls()).expect("ssl context");
-            if let Ok(ca_file) = std::env::var("SCYLLA_CA_BUNDLE") {
-                ctx.set_ca_file(ca_file).expect("set ca file");
-            }
-            let insecure = std::env::var("SCYLLA_SSL_INSECURE")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-            ctx.set_verify(if insecure {
-                SslVerifyMode::NONE
-            } else {
-                SslVerifyMode::PEER
-            });
-            let ctx = ctx.build();
-            sb = sb.ssl_context(Some(ctx));
-        }
-        let scy_session = sb.build().await.expect("failed to connect to SCYLLA_URI");
-        let handler = MinimalHandler::new(scy_session);
+        let session_config = SessionConfig::from_env();
+        let session_state = Arc::new(SessionState::new(session_config));
+        let handler = MinimalHandler::new(session_state.clone());
         let server = server_runtime::create_server(server_details, transport, handler);
+        // Attempt to establish the Scylla connection in the background so that we can surface
+        // a helpful log message without blocking the MCP initialization handshake.
+        tokio::spawn(async move {
+            if let Err(err) = session_state.session().await {
+                error!("failed to establish initial Scylla connection: {err}");
+            }
+        });
         server.start().await
     }
 
     // Basic handler – extend as we implement tools
     use std::collections::HashMap as StdHashMap;
-    use std::sync::Arc;
     use tokio::sync::RwLock;
 
     pub struct MinimalHandler {
-        session: scylla::Session,
+        session_state: Arc<SessionState>,
         schema_cache: Arc<RwLock<StdHashMap<(String, String), crate::db::DescribeTable>>>,
     }
 
     impl MinimalHandler {
-        fn new(session: scylla::Session) -> Self {
+        fn new(session_state: Arc<SessionState>) -> Self {
             Self {
-                session,
+                session_state,
                 schema_cache: Arc::new(RwLock::new(StdHashMap::new())),
             }
+        }
+
+        async fn session(&self) -> Result<Arc<scylla::Session>> {
+            self.session_state.session().await
         }
 
         async fn get_schema(
@@ -214,7 +201,14 @@ pub mod mcp {
                 if backoff_ms > 0 {
                     sleep(Duration::from_millis(backoff_ms)).await;
                 }
-                match crate::db::describe_table_with(&self.session, keyspace, table).await {
+                let session = match self.session().await {
+                    Ok(session) => session,
+                    Err(err) => {
+                        last_err = Some(err);
+                        continue;
+                    }
+                };
+                match crate::db::describe_table_with(&session, keyspace, table).await {
                     Ok(schema) => {
                         self.schema_cache
                             .write()
@@ -230,6 +224,105 @@ pub mod mcp {
             let err = last_err.unwrap_or_else(|| anyhow::anyhow!("unknown schema error"));
             Err(err)
         }
+    }
+
+    #[derive(Clone, Debug)]
+    struct SessionConfig {
+        uri: String,
+        credentials: Option<(String, String)>,
+        ssl: Option<SslConfig>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct SslConfig {
+        ca_bundle: Option<String>,
+        insecure: bool,
+    }
+
+    impl SessionConfig {
+        fn from_env() -> Self {
+            let uri = std::env::var("SCYLLA_URI").unwrap_or_else(|_| "127.0.0.1:9042".to_string());
+            let credentials = match (std::env::var("SCYLLA_USER"), std::env::var("SCYLLA_PASS")) {
+                (Ok(user), Ok(pass)) => Some((user, pass)),
+                _ => None,
+            };
+            let ssl_enabled = std::env::var("SCYLLA_SSL")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let ssl = if ssl_enabled {
+                let ca_bundle = std::env::var("SCYLLA_CA_BUNDLE").ok();
+                let insecure = std::env::var("SCYLLA_SSL_INSECURE")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+                Some(SslConfig {
+                    ca_bundle,
+                    insecure,
+                })
+            } else {
+                None
+            };
+            Self {
+                uri,
+                credentials,
+                ssl,
+            }
+        }
+    }
+
+    struct SessionState {
+        config: SessionConfig,
+        cell: OnceCell<Arc<ScyllaSession>>,
+    }
+
+    type ScyllaSession = scylla::Session;
+
+    impl SessionState {
+        fn new(config: SessionConfig) -> Self {
+            Self {
+                config,
+                cell: OnceCell::new(),
+            }
+        }
+
+        async fn session(&self) -> Result<Arc<ScyllaSession>> {
+            let session = self
+                .cell
+                .get_or_try_init(|| async {
+                    build_session(&self.config)
+                        .await
+                        .map(Arc::new)
+                        .with_context(|| "unable to initialize Scylla session")
+                })
+                .await?;
+            Ok(Arc::clone(session))
+        }
+    }
+
+    async fn build_session(config: &SessionConfig) -> Result<ScyllaSession> {
+        let mut builder = scylla::SessionBuilder::new();
+        builder = builder.known_node(config.uri.clone());
+        if let Some((ref user, ref pass)) = config.credentials {
+            builder = builder.user(user.clone(), pass.clone());
+        }
+        if let Some(ssl) = &config.ssl {
+            use openssl::ssl::{SslContext, SslMethod, SslVerifyMode};
+            let mut ctx =
+                SslContext::builder(SslMethod::tls()).context("failed to build SSL context")?;
+            if let Some(path) = &ssl.ca_bundle {
+                ctx.set_ca_file(path)
+                    .context("failed to load SCYLLA_CA_BUNDLE")?;
+            }
+            ctx.set_verify(if ssl.insecure {
+                SslVerifyMode::NONE
+            } else {
+                SslVerifyMode::PEER
+            });
+            builder = builder.ssl_context(Some(ctx.build()));
+        }
+        builder
+            .build()
+            .await
+            .context("failed to connect to SCYLLA_URI")
     }
 
     #[async_trait::async_trait]
@@ -463,7 +556,14 @@ pub mod mcp {
                 "list_keyspaces" => {
                     let span = tracing::info_span!("tool", name = "list_keyspaces");
                     let _g = span.enter();
-                    match crate::db::list_keyspaces_with(&self.session).await {
+                    let session = match self.session().await {
+                        Ok(session) => session,
+                        Err(err) => {
+                            let msg = format!("list_keyspaces failed to connect: {err}");
+                            return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
+                        }
+                    };
+                    match crate::db::list_keyspaces_with(&session).await {
                         Ok(list) => {
                             let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into());
                             Ok(rust_mcp_schema::CallToolResult::text_content(json, None))
@@ -488,7 +588,14 @@ pub mod mcp {
                     let keyspace = ks.unwrap();
                     let span = tracing::info_span!("tool", name = "list_tables", %keyspace);
                     let _g = span.enter();
-                    match crate::db::list_tables_with(&self.session, &keyspace).await {
+                    let session = match self.session().await {
+                        Ok(session) => session,
+                        Err(err) => {
+                            let msg = format!("list_tables failed to connect: {err}");
+                            return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
+                        }
+                    };
+                    match crate::db::list_tables_with(&session, &keyspace).await {
                         Ok(list) => {
                             let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into());
                             Ok(rust_mcp_schema::CallToolResult::text_content(json, None))
@@ -578,14 +685,15 @@ pub mod mcp {
                     let limit = (limit_u64 as u32).clamp(1, 500);
                     let span = tracing::info_span!("tool", name = "sample_rows", %keyspace, %table, limit = limit as i64);
                     let _g = span.enter();
-                    match crate::db::sample_rows_with(
-                        &self.session,
-                        &keyspace,
-                        &table,
-                        limit,
-                        filters,
-                    )
-                    .await
+                    let session = match self.session().await {
+                        Ok(session) => session,
+                        Err(err) => {
+                            let msg = format!("sample_rows failed to connect: {err}");
+                            return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
+                        }
+                    };
+                    match crate::db::sample_rows_with(&session, &keyspace, &table, limit, filters)
+                        .await
                     {
                         Ok(rows) => {
                             let json = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into());
@@ -705,8 +813,15 @@ pub mod mcp {
                     }
                     let span = tracing::info_span!("tool", name = "select", %keyspace, %table, limit = limit as i64);
                     let _g = span.enter();
+                    let session = match self.session().await {
+                        Ok(session) => session,
+                        Err(err) => {
+                            let msg = format!("select failed to connect: {err}");
+                            return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
+                        }
+                    };
                     match crate::db::select_columns_with(
-                        &self.session,
+                        &session,
                         &keyspace,
                         &table,
                         &columns,
@@ -821,8 +936,15 @@ pub mod mcp {
                     });
                     let span = tracing::info_span!("tool", name = "paged_select", %keyspace, %table, page_size);
                     let _g = span.enter();
+                    let session = match self.session().await {
+                        Ok(session) => session,
+                        Err(err) => {
+                            let msg = format!("paged_select failed to connect: {err}");
+                            return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
+                        }
+                    };
                     match crate::db::paged_select_with(
-                        &self.session,
+                        &session,
                         &keyspace,
                         &table,
                         &columns,
@@ -893,12 +1015,15 @@ pub mod mcp {
                     }
                     let span = tracing::info_span!("tool", name = "partition_rows", %keyspace, %table, limit = limit as i64);
                     let _g = span.enter();
+                    let session = match self.session().await {
+                        Ok(session) => session,
+                        Err(err) => {
+                            let msg = format!("partition_rows failed to connect: {err}");
+                            return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
+                        }
+                    };
                     match crate::db::partition_rows_with(
-                        &self.session,
-                        &keyspace,
-                        &table,
-                        partition,
-                        limit,
+                        &session, &keyspace, &table, partition, limit,
                     )
                     .await
                     {
@@ -915,7 +1040,14 @@ pub mod mcp {
                 "cluster_topology" => {
                     let span = tracing::info_span!("tool", name = "cluster_topology");
                     let _g = span.enter();
-                    match crate::db::cluster_topology_with(&self.session).await {
+                    let session = match self.session().await {
+                        Ok(session) => session,
+                        Err(err) => {
+                            let msg = format!("cluster_topology failed to connect: {err}");
+                            return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
+                        }
+                    };
+                    match crate::db::cluster_topology_with(&session).await {
                         Ok(nodes) => {
                             let json =
                                 serde_json::to_string(&nodes).unwrap_or_else(|_| "[]".into());
@@ -945,7 +1077,14 @@ pub mod mcp {
                     let span =
                         tracing::info_span!("tool", name = "list_indexes", %keyspace, %table);
                     let _g = span.enter();
-                    match crate::db::list_indexes_with(&self.session, &keyspace, &table).await {
+                    let session = match self.session().await {
+                        Ok(session) => session,
+                        Err(err) => {
+                            let msg = format!("list_indexes failed to connect: {err}");
+                            return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
+                        }
+                    };
+                    match crate::db::list_indexes_with(&session, &keyspace, &table).await {
                         Ok(list) => {
                             let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into());
                             Ok(rust_mcp_schema::CallToolResult::text_content(json, None))
@@ -969,7 +1108,14 @@ pub mod mcp {
                     let span =
                         tracing::info_span!("tool", name = "keyspace_replication", %keyspace);
                     let _g = span.enter();
-                    match crate::db::keyspace_replication_with(&self.session, &keyspace).await {
+                    let session = match self.session().await {
+                        Ok(session) => session,
+                        Err(err) => {
+                            let msg = format!("keyspace_replication failed to connect: {err}");
+                            return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
+                        }
+                    };
+                    match crate::db::keyspace_replication_with(&session, &keyspace).await {
                         Ok(obj) => {
                             let json = serde_json::to_string(&obj).unwrap_or_else(|_| "{}".into());
                             Ok(rust_mcp_schema::CallToolResult::text_content(json, None))
@@ -992,7 +1138,14 @@ pub mod mcp {
                     let keyspace = ks.unwrap();
                     let span = tracing::info_span!("tool", name = "list_views", %keyspace);
                     let _g = span.enter();
-                    match crate::db::list_views_with(&self.session, &keyspace).await {
+                    let session = match self.session().await {
+                        Ok(session) => session,
+                        Err(err) => {
+                            let msg = format!("list_views failed to connect: {err}");
+                            return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
+                        }
+                    };
+                    match crate::db::list_views_with(&session, &keyspace).await {
                         Ok(list) => {
                             let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into());
                             Ok(rust_mcp_schema::CallToolResult::text_content(json, None))
@@ -1015,7 +1168,14 @@ pub mod mcp {
                     let keyspace = ks.unwrap();
                     let span = tracing::info_span!("tool", name = "list_udts", %keyspace);
                     let _g = span.enter();
-                    match crate::db::list_udts_with(&self.session, &keyspace).await {
+                    let session = match self.session().await {
+                        Ok(session) => session,
+                        Err(err) => {
+                            let msg = format!("list_udts failed to connect: {err}");
+                            return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
+                        }
+                    };
+                    match crate::db::list_udts_with(&session, &keyspace).await {
                         Ok(list) => {
                             let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into());
                             Ok(rust_mcp_schema::CallToolResult::text_content(json, None))
@@ -1038,7 +1198,14 @@ pub mod mcp {
                     let keyspace = ks.unwrap();
                     let span = tracing::info_span!("tool", name = "list_functions", %keyspace);
                     let _g = span.enter();
-                    match crate::db::list_functions_with(&self.session, &keyspace).await {
+                    let session = match self.session().await {
+                        Ok(session) => session,
+                        Err(err) => {
+                            let msg = format!("list_functions failed to connect: {err}");
+                            return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
+                        }
+                    };
+                    match crate::db::list_functions_with(&session, &keyspace).await {
                         Ok(list) => {
                             let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into());
                             Ok(rust_mcp_schema::CallToolResult::text_content(json, None))
@@ -1061,7 +1228,14 @@ pub mod mcp {
                     let keyspace = ks.unwrap();
                     let span = tracing::info_span!("tool", name = "list_aggregates", %keyspace);
                     let _g = span.enter();
-                    match crate::db::list_aggregates_with(&self.session, &keyspace).await {
+                    let session = match self.session().await {
+                        Ok(session) => session,
+                        Err(err) => {
+                            let msg = format!("list_aggregates failed to connect: {err}");
+                            return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
+                        }
+                    };
+                    match crate::db::list_aggregates_with(&session, &keyspace).await {
                         Ok(list) => {
                             let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into());
                             Ok(rust_mcp_schema::CallToolResult::text_content(json, None))
@@ -1090,7 +1264,14 @@ pub mod mcp {
                     let span =
                         tracing::info_span!("tool", name = "size_estimates", %keyspace, %table);
                     let _g = span.enter();
-                    match crate::db::size_estimates_with(&self.session, &keyspace, &table).await {
+                    let session = match self.session().await {
+                        Ok(session) => session,
+                        Err(err) => {
+                            let msg = format!("size_estimates failed to connect: {err}");
+                            return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
+                        }
+                    };
+                    match crate::db::size_estimates_with(&session, &keyspace, &table).await {
                         Ok(obj) => {
                             let json = serde_json::to_string(&obj).unwrap_or_else(|_| "[]".into());
                             Ok(rust_mcp_schema::CallToolResult::text_content(json, None))
@@ -1116,9 +1297,14 @@ pub mod mcp {
                     let pat = pattern.unwrap();
                     let span = tracing::info_span!("tool", name = "search_schema", %pat, keyspace = keyspace.as_deref().unwrap_or("<all>"));
                     let _g = span.enter();
-                    match crate::db::search_schema_with(&self.session, &pat, keyspace.as_deref())
-                        .await
-                    {
+                    let session = match self.session().await {
+                        Ok(session) => session,
+                        Err(err) => {
+                            let msg = format!("search_schema failed to connect: {err}");
+                            return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
+                        }
+                    };
+                    match crate::db::search_schema_with(&session, &pat, keyspace.as_deref()).await {
                         Ok(items) => {
                             let json =
                                 serde_json::to_string(&items).unwrap_or_else(|_| "[]".into());
