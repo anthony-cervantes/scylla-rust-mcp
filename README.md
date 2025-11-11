@@ -35,12 +35,14 @@ Run (stdio transport):
 # Plaintext
 docker run --rm -i \
   -e SCYLLA_URI=host.docker.internal:9042 \
+  -e MCP_FRAMING=content-length \
   scylla-rust-mcp:latest
 
 # TLS
 docker run --rm -i \
   -e SCYLLA_URI=my-scylla.example.com:9142 \
   -e SCYLLA_SSL=true \
+  -e MCP_FRAMING=content-length \
   scylla-rust-mcp:latest
 
 # TLS + custom CA
@@ -49,6 +51,7 @@ docker run --rm -i \
   -e SCYLLA_URI=my-scylla.example.com:9142 \
   -e SCYLLA_SSL=true \
   -e SCYLLA_CA_BUNDLE=/ca.pem \
+  -e MCP_FRAMING=content-length \
   scylla-rust-mcp:latest
 ```
 
@@ -59,6 +62,7 @@ Environment:
 - `SCYLLA_CA_BUNDLE` (optional): absolute path to CA bundle in the container
 - `SCYLLA_SSL_INSECURE` (optional): `true`/`1` to skip verification (dev only)
 - `RUST_LOG` (optional): log level, e.g. `info`, `debug`
+- `MCP_FRAMING` (optional): `content-length` (default) for RMCP stdio framing, or `newline` for legacy newline-delimited JSON (for manual testing only)
 
 Linux note: `host.docker.internal` may not resolve; use your host IP or mapped ports.
 
@@ -72,6 +76,7 @@ Plaintext (localhost):
 command = "docker"
 args = [
   "run","--rm","-i",
+  "-e","MCP_FRAMING=content-length",
   "-e","SCYLLA_URI=host.docker.internal:9042",
   "ghcr.io/anthony-cervantes/scylla-rust-mcp:latest"
 ]
@@ -83,6 +88,7 @@ TLS (insecure) with auth (placeholders):
 command = "docker"
 args = [
   "run","--rm","-i",
+  "-e","MCP_FRAMING=content-length",
   "-e","SCYLLA_URI=scylla.example.com:9142",
   "-e","SCYLLA_USER=scylla",
   "-e","SCYLLA_PASS=<password>",
@@ -98,6 +104,7 @@ TLS with custom CA bundle:
 command = "docker"
 args = [
   "run","--rm","-i",
+  "-e","MCP_FRAMING=content-length",
   "-v","/absolute/path/ca.pem:/ca.pem:ro",
   "-e","SCYLLA_URI=scylla.example.com:9142",
   "-e","SCYLLA_SSL=true",
@@ -123,6 +130,7 @@ Plaintext (localhost):
       "command": "docker",
       "args": [
         "run","--rm","-i",
+        "-e","MCP_FRAMING=content-length",
         "-e","SCYLLA_URI=host.docker.internal:9042",
         "ghcr.io/anthony-cervantes/scylla-rust-mcp:latest"
       ]
@@ -139,6 +147,7 @@ TLS (insecure) with auth (placeholders):
       "command": "docker",
       "args": [
         "run","--rm","-i",
+        "-e","MCP_FRAMING=content-length",
         "-e","SCYLLA_URI=scylla.example.com:9142",
         "-e","SCYLLA_USER=scylla",
         "-e","SCYLLA_PASS=<password>",
@@ -159,6 +168,7 @@ TLS with custom CA bundle:
       "command": "docker",
       "args": [
         "run","--rm","-i",
+        "-e","MCP_FRAMING=content-length",
         "-v","/absolute/path/ca.pem:/ca.pem:ro",
         "-e","SCYLLA_URI=scylla.example.com:9142",
         "-e","SCYLLA_SSL=true",
@@ -181,7 +191,11 @@ Prerequisites
 Build and run (stdio server):
 ```bash
 export SCYLLA_URI=127.0.0.1:9042
+# Default uses Content-Length (RMCP framing)
 cargo run
+
+# For manual newline-delimited JSON testing
+MCP_FRAMING=newline cargo run
 ```
 
 Quality checks

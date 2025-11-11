@@ -122,9 +122,10 @@ pub mod mcp {
     use tracing_subscriber::EnvFilter;
 
     pub async fn run_stdio_server() -> SdkResult<()> {
-        // basic, human-friendly logging for early development
+        // Route logs to stderr so stdout remains a clean MCP transport channel.
         let _ = tracing_subscriber::fmt()
             .with_env_filter(EnvFilter::from_default_env().add_directive(Level::INFO.into()))
+            .with_writer(std::io::stderr)
             .try_init();
 
         info!("starting MCP stdio server (rust-mcp-sdk)");
@@ -1322,6 +1323,89 @@ pub mod mcp {
                 }
             }
         }
+    }
+}
+
+pub mod rmcp_server {
+    use crate::server;
+    use anyhow::Result;
+    use rmcp::{
+        model::*, service::RequestContext, transport::stdio, RoleServer, ServerHandler, ServiceExt,
+    };
+    use std::borrow::Cow;
+    use std::sync::Arc;
+    use tracing::{info, Level};
+    use tracing_subscriber::EnvFilter;
+
+    #[derive(Clone)]
+    struct BridgeHandler;
+
+    impl ServerHandler for BridgeHandler {
+        fn get_info(&self) -> ServerInfo {
+            // Enable tools; other capabilities can be enabled later.
+            ServerInfo {
+                instructions: Some("Read-only ScyllaDB access for AI agents".into()),
+                capabilities: ServerCapabilities::builder().enable_tools().build(),
+                ..Default::default()
+            }
+        }
+
+        // List tools using our existing static tool metadata.
+        // For now, we construct simple tool entries; input schemas will be basic objects.
+        // We can refine schemas as we migrate each tool.
+        async fn list_tools(
+            &self,
+            _request: Option<PaginatedRequestParam>,
+            _ctx: RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, rmcp::ErrorData> {
+            let items = server::list_tools()
+                .into_iter()
+                .map(|t| Tool {
+                    name: Cow::Owned(t.name.to_string()),
+                    description: Some(Cow::Owned(t.description.to_string())),
+                    input_schema: Arc::new(json_schema_empty_object()),
+                    output_schema: None,
+                    annotations: None,
+                })
+                .collect::<Vec<_>>();
+            Ok(ListToolsResult::with_all_items(items))
+        }
+
+        // Until we migrate each tool, return unknown tool error so handshake and discovery work.
+        async fn call_tool(
+            &self,
+            request: CallToolRequestParam,
+            _ctx: RequestContext<RoleServer>,
+        ) -> Result<CallToolResult, rmcp::ErrorData> {
+            Err(ErrorData::invalid_request(
+                "unknown_tool",
+                Some(serde_json::json!({ "name": request.name })),
+            ))
+        }
+    }
+
+    fn json_schema_empty_object() -> serde_json::Map<String, serde_json::Value> {
+        use serde_json::{json, Map, Value};
+        let mut schema = Map::new();
+        schema.insert("type".into(), Value::String("object".into()));
+        schema.insert("properties".into(), json!({}));
+        schema
+    }
+
+    pub async fn run_stdio_server() -> Result<()> {
+        // Route logs to stderr so stdout remains a clean MCP transport channel.
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_default_env().add_directive(Level::INFO.into()))
+            .with_writer(std::io::stderr)
+            .try_init();
+        info!("starting MCP stdio server (rmcp, Content-Length)");
+
+        // Start RMCP stdio (Content-Length framing)
+        let handler = BridgeHandler;
+        let service = handler.serve(stdio()).await?;
+        // Wait for client disconnect
+        service.waiting().await?;
+        Ok(())
     }
 }
 

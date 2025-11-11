@@ -10,3 +10,4 @@
 *.pem
 *.crt
 *.key
+.cargo_home
