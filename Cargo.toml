@@ -1,6 +1,6 @@
 [package]
 name = "scylla-rust-mcp"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
@@ -19,3 +19,4 @@ async-trait = { version = "0.1" }
 base64 = { version = "0.22" }
 openssl = { version = "0.10" }
 scylla-cql = { version = "0.3" }
+rmcp = { version = "0.5", features = ["transport-io"] }
