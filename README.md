@@ -209,6 +209,7 @@ Quality checks
 - `just version-show` — print current package version
 - `just version-set 0.1.7` — bump Cargo.toml version and commit
 - `just tag` — create and push tag `v<current-version>`
+- `just release-local [x.y.z]` — clean-tree local release: bump, commit, local tag, install from tag, verify install
 - `just docker-build` — build dev image (`ghcr.io/...:dev`)
 - `just docker-run` — run image against `SCYLLA_URI` (defaults to localhost)
 

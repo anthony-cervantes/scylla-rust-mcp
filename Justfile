@@ -26,6 +26,11 @@ tag version="":
   git tag -a "v${v}" -m "v${v}"
   git push origin "v${v}"
 
+# Local release flow: bump + commit + local tag + install from that tag + verify
+release-local version="":
+  set -euo pipefail
+  [ -n "{{version}}" ] && ./scripts/release-local.sh --version "{{version}}" || ./scripts/release-local.sh
+
 # Formatting, linting, tests
 fmt:
   cargo fmt --all

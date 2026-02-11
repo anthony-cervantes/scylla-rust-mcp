@@ -151,17 +151,9 @@ pub mod mcp {
         };
 
         let transport = StdioTransport::new(TransportOptions::default())?;
-        let session_config = SessionConfig::from_env();
-        let session_state = Arc::new(SessionState::new(session_config));
-        let handler = MinimalHandler::new(session_state.clone());
+        let handler = ToolExecutor::from_env();
+        handler.warmup_connection();
         let server = server_runtime::create_server(server_details, transport, handler);
-        // Attempt to establish the Scylla connection in the background so that we can surface
-        // a helpful log message without blocking the MCP initialization handshake.
-        tokio::spawn(async move {
-            if let Err(err) = session_state.session().await {
-                error!("failed to establish initial Scylla connection: {err}");
-            }
-        });
         server.start().await
     }
 
@@ -169,17 +161,82 @@ pub mod mcp {
     use std::collections::HashMap as StdHashMap;
     use tokio::sync::RwLock;
 
-    pub struct MinimalHandler {
+    #[derive(Debug, Clone)]
+    pub struct ToolOutput {
+        pub text: String,
+        pub is_error: bool,
+    }
+
+    impl ToolOutput {
+        fn ok(text: String) -> Self {
+            Self {
+                text,
+                is_error: false,
+            }
+        }
+
+        fn error(text: String) -> Self {
+            Self {
+                text,
+                is_error: true,
+            }
+        }
+
+        fn text_content(text: String, _annotations: Option<serde_json::Value>) -> Self {
+            let trimmed = text.trim_start();
+            let looks_like_json = trimmed.starts_with('{') || trimmed.starts_with('[');
+            let is_error = !looks_like_json
+                && (text.starts_with("missing required")
+                    || text.starts_with("invalid ")
+                    || text.starts_with("partition keys mismatch")
+                    || text.starts_with("schema fetch failed")
+                    || text.contains(" failed")
+                    || text.contains("not yet implemented"));
+            if is_error {
+                Self::error(text)
+            } else {
+                Self::ok(text)
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct ExecuteRequest {
+        params: ExecuteRequestParams,
+    }
+
+    #[derive(Debug, Clone)]
+    struct ExecuteRequestParams {
+        name: String,
+        arguments: Option<serde_json::Map<String, serde_json::Value>>,
+    }
+
+    pub struct ToolExecutor {
         session_state: Arc<SessionState>,
         schema_cache: Arc<RwLock<StdHashMap<(String, String), crate::db::DescribeTable>>>,
     }
 
-    impl MinimalHandler {
+    impl ToolExecutor {
         fn new(session_state: Arc<SessionState>) -> Self {
             Self {
                 session_state,
                 schema_cache: Arc::new(RwLock::new(StdHashMap::new())),
             }
+        }
+
+        pub(crate) fn from_env() -> Self {
+            let session_config = SessionConfig::from_env();
+            let session_state = Arc::new(SessionState::new(session_config));
+            Self::new(session_state)
+        }
+
+        pub(crate) fn warmup_connection(&self) {
+            let session_state = Arc::clone(&self.session_state);
+            tokio::spawn(async move {
+                if let Err(err) = session_state.session().await {
+                    error!("failed to establish initial Scylla connection: {err}");
+                }
+            });
         }
 
         async fn session(&self) -> Result<Arc<scylla::Session>> {
@@ -224,6 +281,786 @@ pub mod mcp {
             }
             let err = last_err.unwrap_or_else(|| anyhow::anyhow!("unknown schema error"));
             Err(err)
+        }
+
+        pub(crate) async fn execute(
+            &self,
+            name: &str,
+            arguments: Option<&serde_json::Map<String, serde_json::Value>>,
+        ) -> ToolOutput {
+            let request = ExecuteRequest {
+                params: ExecuteRequestParams {
+                    name: name.to_string(),
+                    arguments: arguments.cloned(),
+                },
+            };
+            let result = self.execute_request(request).await;
+            match result {
+                Ok(output) => output,
+                Err(never) => match never {},
+            }
+        }
+
+        async fn execute_request(
+            &self,
+            request: ExecuteRequest,
+        ) -> std::result::Result<ToolOutput, std::convert::Infallible> {
+            let name = request.params.name.clone();
+            match name.as_str() {
+                "list_keyspaces" => {
+                    let span = tracing::info_span!("tool", name = "list_keyspaces");
+                    let _g = span.enter();
+                    let session = match self.session().await {
+                        Ok(session) => session,
+                        Err(err) => {
+                            let msg = format!("list_keyspaces failed to connect: {err}");
+                            return Ok(ToolOutput::error(msg));
+                        }
+                    };
+                    match crate::db::list_keyspaces_with(&session).await {
+                        Ok(list) => {
+                            let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into());
+                            Ok(ToolOutput::text_content(json, None))
+                        }
+                        Err(err) => {
+                            let msg = format!("list_keyspaces failed: {}", err);
+                            Ok(ToolOutput::error(msg))
+                        }
+                    }
+                }
+                "list_tables" => {
+                    // extract keyspace from arguments
+                    let ks = request.params.arguments.as_ref().and_then(|m| {
+                        m.get("keyspace")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    });
+                    if ks.is_none() {
+                        let msg = "missing required argument 'keyspace'".to_string();
+                        return Ok(ToolOutput::error(msg));
+                    }
+                    let keyspace = ks.unwrap();
+                    let span = tracing::info_span!("tool", name = "list_tables", %keyspace);
+                    let _g = span.enter();
+                    let session = match self.session().await {
+                        Ok(session) => session,
+                        Err(err) => {
+                            let msg = format!("list_tables failed to connect: {err}");
+                            return Ok(ToolOutput::error(msg));
+                        }
+                    };
+                    match crate::db::list_tables_with(&session, &keyspace).await {
+                        Ok(list) => {
+                            let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into());
+                            Ok(ToolOutput::text_content(json, None))
+                        }
+                        Err(err) => {
+                            let msg = format!("list_tables failed: {}", err);
+                            Ok(ToolOutput::error(msg))
+                        }
+                    }
+                }
+                "describe_table" => {
+                    // extract keyspace and table from arguments
+                    let args = request.params.arguments.as_ref();
+                    let ks = args
+                        .and_then(|m| m.get("keyspace").and_then(|v| v.as_str()))
+                        .map(|s| s.to_string());
+                    let tb = args
+                        .and_then(|m| m.get("table").and_then(|v| v.as_str()))
+                        .map(|s| s.to_string());
+                    if ks.is_none() || tb.is_none() {
+                        let msg =
+                            "missing required arguments 'keyspace' and/or 'table'".to_string();
+                        return Ok(ToolOutput::error(msg));
+                    }
+                    match self
+                        .get_schema(&ks.clone().unwrap(), &tb.clone().unwrap())
+                        .await
+                    {
+                        Ok(cols) => {
+                            let json = serde_json::to_string(&cols).unwrap_or_else(|_| "{}".into());
+                            Ok(ToolOutput::text_content(json, None))
+                        }
+                        Err(err) => {
+                            let msg = format!("describe_table failed: {}", err);
+                            Ok(ToolOutput::error(msg))
+                        }
+                    }
+                }
+                "sample_rows" => {
+                    let args = request.params.arguments.as_ref();
+                    let ks = args
+                        .and_then(|m| m.get("keyspace").and_then(|v| v.as_str()))
+                        .map(|s| s.to_string());
+                    let tb = args
+                        .and_then(|m| m.get("table").and_then(|v| v.as_str()))
+                        .map(|s| s.to_string());
+                    let lm = args.and_then(|m| m.get("limit").and_then(|v| v.as_u64()));
+                    let filters = args
+                        .and_then(|m| m.get("filters"))
+                        .and_then(|v| v.as_object());
+                    let Some((keyspace, table, limit_u64)) =
+                        ks.zip(tb).zip(lm).map(|((a, b), c)| (a, b, c))
+                    else {
+                        let msg = "missing required arguments 'keyspace', 'table', or 'limit'"
+                            .to_string();
+                        return Ok(ToolOutput::error(msg));
+                    };
+                    // Validate filter keys exist
+                    if let Some(f) = filters {
+                        match self.get_schema(&keyspace, &table).await {
+                            Ok(schema) => {
+                                let available: std::collections::HashSet<String> = schema
+                                    .columns
+                                    .iter()
+                                    .map(|c| c.column_name.clone())
+                                    .collect();
+                                for col in f.keys() {
+                                    if !available.contains(col) {
+                                        let msg = format!(
+                                            "invalid filter column '{}'; not in table columns",
+                                            col
+                                        );
+                                        return Ok(ToolOutput::error(msg));
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                let msg = format!("schema fetch failed: {}", err);
+                                return Ok(ToolOutput::error(msg));
+                            }
+                        }
+                    }
+                    let limit = (limit_u64 as u32).clamp(1, 500);
+                    let span = tracing::info_span!("tool", name = "sample_rows", %keyspace, %table, limit = limit as i64);
+                    let _g = span.enter();
+                    let session = match self.session().await {
+                        Ok(session) => session,
+                        Err(err) => {
+                            let msg = format!("sample_rows failed to connect: {err}");
+                            return Ok(ToolOutput::error(msg));
+                        }
+                    };
+                    match crate::db::sample_rows_with(&session, &keyspace, &table, limit, filters)
+                        .await
+                    {
+                        Ok(rows) => {
+                            let json = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into());
+                            Ok(ToolOutput::text_content(json, None))
+                        }
+                        Err(err) => {
+                            let msg = format!("sample_rows failed: {}", err);
+                            Ok(ToolOutput::error(msg))
+                        }
+                    }
+                }
+                "select" => {
+                    let args = request.params.arguments.as_ref();
+                    let ks = args
+                        .and_then(|m| m.get("keyspace").and_then(|v| v.as_str()))
+                        .map(|s| s.to_string());
+                    let tb = args
+                        .and_then(|m| m.get("table").and_then(|v| v.as_str()))
+                        .map(|s| s.to_string());
+                    let cols =
+                        args.and_then(|m| m.get("columns").and_then(|v| v.as_array()).cloned());
+                    let lm = args.and_then(|m| m.get("limit").and_then(|v| v.as_u64()));
+                    let filters = args
+                        .and_then(|m| m.get("filters"))
+                        .and_then(|v| v.as_object());
+                    let order_by = args
+                        .and_then(|m| m.get("order_by").or_else(|| m.get("orderBy")))
+                        .and_then(|v| v.as_array().cloned());
+                    if ks.is_none() || tb.is_none() || cols.is_none() || lm.is_none() {
+                        let msg =
+                            "missing required arguments 'keyspace', 'table', 'columns', or 'limit'"
+                                .to_string();
+                        return Ok(ToolOutput::error(msg));
+                    }
+                    let keyspace = ks.unwrap();
+                    let table = tb.unwrap();
+                    let columns: Vec<String> = cols
+                        .unwrap()
+                        .iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect();
+                    let limit = (lm.unwrap() as u32).clamp(1, 500);
+                    // Validate requested columns and filter keys exist
+                    match self.get_schema(&keyspace, &table).await {
+                        Ok(schema) => {
+                            let available: std::collections::HashSet<String> = schema
+                                .columns
+                                .iter()
+                                .map(|c| c.column_name.clone())
+                                .collect();
+                            for c in columns.iter() {
+                                if !available.contains(c) {
+                                    let msg = format!(
+                                        "invalid column '{}' in select; not in table columns",
+                                        c
+                                    );
+                                    return Ok(ToolOutput::error(msg));
+                                }
+                            }
+                            if let Some(f) = &filters {
+                                for col in f.keys() {
+                                    if !available.contains(col) {
+                                        let msg = format!(
+                                            "invalid filter column '{}'; not in table columns",
+                                            col
+                                        );
+                                        return Ok(ToolOutput::error(msg));
+                                    }
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            let msg = format!("schema fetch failed: {}", err);
+                            return Ok(ToolOutput::error(msg));
+                        }
+                    }
+                    let order_tuples: Option<Vec<(String, String)>> = order_by.map(|arr| {
+                        arr.into_iter()
+                            .filter_map(|item| item.as_object().cloned())
+                            .filter_map(|m| {
+                                let col = m.get("column").and_then(|v| v.as_str())?;
+                                let dir =
+                                    m.get("direction").and_then(|v| v.as_str()).unwrap_or("asc");
+                                Some((col.to_string(), dir.to_string()))
+                            })
+                            .collect()
+                    });
+                    // Enforce order_by only on clustering keys
+                    if let Some(ref ords) = order_tuples {
+                        match self.get_schema(&keyspace, &table).await {
+                            Ok(schema) => {
+                                let allowed: std::collections::HashSet<String> =
+                                    schema.clustering_keys.iter().cloned().collect();
+                                for (col, _) in ords.iter() {
+                                    if !allowed.contains(col) {
+                                        let msg = format!(
+                                            "invalid order_by column '{}'; only clustering keys are allowed: {:?}",
+                                            col, schema.clustering_keys
+                                        );
+                                        return Ok(ToolOutput::error(msg));
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                let msg = format!("schema fetch failed: {}", err);
+                                return Ok(ToolOutput::error(msg));
+                            }
+                        }
+                    }
+                    let span = tracing::info_span!("tool", name = "select", %keyspace, %table, limit = limit as i64);
+                    let _g = span.enter();
+                    let session = match self.session().await {
+                        Ok(session) => session,
+                        Err(err) => {
+                            let msg = format!("select failed to connect: {err}");
+                            return Ok(ToolOutput::error(msg));
+                        }
+                    };
+                    match crate::db::select_columns_with(
+                        &session,
+                        &keyspace,
+                        &table,
+                        &columns,
+                        limit,
+                        filters,
+                        order_tuples.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(rows) => {
+                            let json = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into());
+                            Ok(ToolOutput::text_content(json, None))
+                        }
+                        Err(err) => {
+                            let msg = format!("select failed: {}", err);
+                            Ok(ToolOutput::error(msg))
+                        }
+                    }
+                }
+                "paged_select" => {
+                    let args = request.params.arguments.as_ref();
+                    let ks = args
+                        .and_then(|m| m.get("keyspace").and_then(|v| v.as_str()))
+                        .map(|s| s.to_string());
+                    let tb = args
+                        .and_then(|m| m.get("table").and_then(|v| v.as_str()))
+                        .map(|s| s.to_string());
+                    let cols =
+                        args.and_then(|m| m.get("columns").and_then(|v| v.as_array()).cloned());
+                    let page_size = args.and_then(|m| m.get("page_size").and_then(|v| v.as_u64()));
+                    let filters = args
+                        .and_then(|m| m.get("filters"))
+                        .and_then(|v| v.as_object());
+                    let order_by = args
+                        .and_then(|m| m.get("order_by").or_else(|| m.get("orderBy")))
+                        .and_then(|v| v.as_array().cloned());
+                    let cursor = args
+                        .and_then(|m| m.get("cursor").and_then(|v| v.as_str()))
+                        .map(|s| s.to_string());
+                    if ks.is_none() || tb.is_none() || cols.is_none() || page_size.is_none() {
+                        let msg = "missing required arguments 'keyspace', 'table', 'columns', or 'page_size'".to_string();
+                        return Ok(ToolOutput::error(msg));
+                    }
+                    let keyspace = ks.unwrap();
+                    let table = tb.unwrap();
+                    let page_size = (page_size.unwrap() as i32).clamp(1, 500);
+                    let columns: Vec<String> = cols
+                        .unwrap()
+                        .iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect();
+                    // Validate columns/filters and enforce order_by on clustering keys
+                    match self.get_schema(&keyspace, &table).await {
+                        Ok(schema) => {
+                            let available: std::collections::HashSet<String> = schema
+                                .columns
+                                .iter()
+                                .map(|c| c.column_name.clone())
+                                .collect();
+                            for c in columns.iter() {
+                                if !available.contains(c) {
+                                    return Ok(ToolOutput::text_content(
+                                        format!("invalid column '{}'", c),
+                                        None,
+                                    ));
+                                }
+                            }
+                            if let Some(f) = &filters {
+                                for col in f.keys() {
+                                    if !available.contains(col) {
+                                        return Ok(ToolOutput::text_content(
+                                            format!("invalid filter column '{}'", col),
+                                            None,
+                                        ));
+                                    }
+                                }
+                            }
+                            if let Some(arr) = &order_by {
+                                let allowed: std::collections::HashSet<String> =
+                                    schema.clustering_keys.iter().cloned().collect();
+                                for item in arr.iter().filter_map(|v| v.as_object()) {
+                                    let Some(col) = item.get("column").and_then(|v| v.as_str())
+                                    else {
+                                        continue;
+                                    };
+                                    if !allowed.contains(col) {
+                                        return Ok(ToolOutput::text_content(
+                                            format!("invalid order_by column '{}'", col),
+                                            None,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            return Ok(ToolOutput::text_content(
+                                format!("schema fetch failed: {}", err),
+                                None,
+                            ));
+                        }
+                    }
+                    let order_tuples: Option<Vec<(String, String)>> = order_by.map(|arr| {
+                        arr.into_iter()
+                            .filter_map(|item| item.as_object().cloned())
+                            .filter_map(|m| {
+                                let col = m.get("column").and_then(|v| v.as_str())?;
+                                let dir =
+                                    m.get("direction").and_then(|v| v.as_str()).unwrap_or("asc");
+                                Some((col.to_string(), dir.to_string()))
+                            })
+                            .collect()
+                    });
+                    let span = tracing::info_span!("tool", name = "paged_select", %keyspace, %table, page_size);
+                    let _g = span.enter();
+                    let session = match self.session().await {
+                        Ok(session) => session,
+                        Err(err) => {
+                            let msg = format!("paged_select failed to connect: {err}");
+                            return Ok(ToolOutput::error(msg));
+                        }
+                    };
+                    match crate::db::paged_select_with(
+                        &session,
+                        &keyspace,
+                        &table,
+                        &columns,
+                        page_size,
+                        filters,
+                        order_tuples.as_ref(),
+                        cursor.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(obj) => {
+                            let json = serde_json::to_string(&obj).unwrap_or_else(|_| "{}".into());
+                            Ok(ToolOutput::text_content(json, None))
+                        }
+                        Err(err) => Ok(ToolOutput::text_content(
+                            format!("paged_select failed: {}", err),
+                            None,
+                        )),
+                    }
+                }
+                "partition_rows" => {
+                    let args = request.params.arguments.as_ref();
+                    let ks = args
+                        .and_then(|m| m.get("keyspace").and_then(|v| v.as_str()))
+                        .map(|s| s.to_string());
+                    let tb = args
+                        .and_then(|m| m.get("table").and_then(|v| v.as_str()))
+                        .map(|s| s.to_string());
+                    let part = args
+                        .and_then(|m| m.get("partition"))
+                        .and_then(|v| v.as_object());
+                    let limit = args
+                        .and_then(|m| m.get("limit").and_then(|v| v.as_u64()))
+                        .map(|n| (n as u32).clamp(1, 500));
+                    if ks.is_none() || tb.is_none() || part.is_none() || limit.is_none() {
+                        let msg =
+                            "missing required arguments 'keyspace','table','partition','limit'"
+                                .to_string();
+                        return Ok(ToolOutput::error(msg));
+                    }
+                    let keyspace = ks.unwrap();
+                    let table = tb.unwrap();
+                    let partition = part.unwrap();
+                    let limit = limit.unwrap();
+                    // Validate exact partition key set against schema (no extras, no missing)
+                    match self.get_schema(&keyspace, &table).await {
+                        Ok(schema) => {
+                            let pk: std::collections::HashSet<String> =
+                                schema.partition_keys.iter().cloned().collect();
+                            let provided: std::collections::HashSet<String> =
+                                partition.keys().cloned().collect();
+                            if pk != provided {
+                                let msg = format!(
+                                    "partition keys mismatch: expected {:?}",
+                                    schema.partition_keys
+                                );
+                                return Ok(ToolOutput::error(msg));
+                            }
+                        }
+                        Err(err) => {
+                            return Ok(ToolOutput::text_content(
+                                format!("schema fetch failed: {}", err),
+                                None,
+                            ));
+                        }
+                    }
+                    let span = tracing::info_span!("tool", name = "partition_rows", %keyspace, %table, limit = limit as i64);
+                    let _g = span.enter();
+                    let session = match self.session().await {
+                        Ok(session) => session,
+                        Err(err) => {
+                            let msg = format!("partition_rows failed to connect: {err}");
+                            return Ok(ToolOutput::error(msg));
+                        }
+                    };
+                    match crate::db::partition_rows_with(
+                        &session, &keyspace, &table, partition, limit,
+                    )
+                    .await
+                    {
+                        Ok(rows) => {
+                            let json = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into());
+                            Ok(ToolOutput::text_content(json, None))
+                        }
+                        Err(err) => Ok(ToolOutput::text_content(
+                            format!("partition_rows failed: {}", err),
+                            None,
+                        )),
+                    }
+                }
+                "cluster_topology" => {
+                    let span = tracing::info_span!("tool", name = "cluster_topology");
+                    let _g = span.enter();
+                    let session = match self.session().await {
+                        Ok(session) => session,
+                        Err(err) => {
+                            let msg = format!("cluster_topology failed to connect: {err}");
+                            return Ok(ToolOutput::error(msg));
+                        }
+                    };
+                    match crate::db::cluster_topology_with(&session).await {
+                        Ok(nodes) => {
+                            let json =
+                                serde_json::to_string(&nodes).unwrap_or_else(|_| "[]".into());
+                            Ok(ToolOutput::text_content(json, None))
+                        }
+                        Err(err) => {
+                            let msg = format!("cluster_topology failed: {}", err);
+                            Ok(ToolOutput::error(msg))
+                        }
+                    }
+                }
+                "list_indexes" => {
+                    let args = request.params.arguments.as_ref();
+                    let ks = args
+                        .and_then(|m| m.get("keyspace").and_then(|v| v.as_str()))
+                        .map(|s| s.to_string());
+                    let tb = args
+                        .and_then(|m| m.get("table").and_then(|v| v.as_str()))
+                        .map(|s| s.to_string());
+                    if ks.is_none() || tb.is_none() {
+                        let msg =
+                            "missing required arguments 'keyspace' and/or 'table'".to_string();
+                        return Ok(ToolOutput::error(msg));
+                    }
+                    let keyspace = ks.unwrap();
+                    let table = tb.unwrap();
+                    let span =
+                        tracing::info_span!("tool", name = "list_indexes", %keyspace, %table);
+                    let _g = span.enter();
+                    let session = match self.session().await {
+                        Ok(session) => session,
+                        Err(err) => {
+                            let msg = format!("list_indexes failed to connect: {err}");
+                            return Ok(ToolOutput::error(msg));
+                        }
+                    };
+                    match crate::db::list_indexes_with(&session, &keyspace, &table).await {
+                        Ok(list) => {
+                            let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into());
+                            Ok(ToolOutput::text_content(json, None))
+                        }
+                        Err(err) => {
+                            let msg = format!("list_indexes failed: {}", err);
+                            Ok(ToolOutput::error(msg))
+                        }
+                    }
+                }
+                "keyspace_replication" => {
+                    let args = request.params.arguments.as_ref();
+                    let ks = args
+                        .and_then(|m| m.get("keyspace").and_then(|v| v.as_str()))
+                        .map(|s| s.to_string());
+                    if ks.is_none() {
+                        let msg = "missing required argument 'keyspace'".to_string();
+                        return Ok(ToolOutput::error(msg));
+                    }
+                    let keyspace = ks.unwrap();
+                    let span =
+                        tracing::info_span!("tool", name = "keyspace_replication", %keyspace);
+                    let _g = span.enter();
+                    let session = match self.session().await {
+                        Ok(session) => session,
+                        Err(err) => {
+                            let msg = format!("keyspace_replication failed to connect: {err}");
+                            return Ok(ToolOutput::error(msg));
+                        }
+                    };
+                    match crate::db::keyspace_replication_with(&session, &keyspace).await {
+                        Ok(obj) => {
+                            let json = serde_json::to_string(&obj).unwrap_or_else(|_| "{}".into());
+                            Ok(ToolOutput::text_content(json, None))
+                        }
+                        Err(err) => {
+                            let msg = format!("keyspace_replication failed: {}", err);
+                            Ok(ToolOutput::error(msg))
+                        }
+                    }
+                }
+                "list_views" => {
+                    let args = request.params.arguments.as_ref();
+                    let ks = args
+                        .and_then(|m| m.get("keyspace").and_then(|v| v.as_str()))
+                        .map(|s| s.to_string());
+                    if ks.is_none() {
+                        let msg = "missing required argument 'keyspace'".to_string();
+                        return Ok(ToolOutput::error(msg));
+                    }
+                    let keyspace = ks.unwrap();
+                    let span = tracing::info_span!("tool", name = "list_views", %keyspace);
+                    let _g = span.enter();
+                    let session = match self.session().await {
+                        Ok(session) => session,
+                        Err(err) => {
+                            let msg = format!("list_views failed to connect: {err}");
+                            return Ok(ToolOutput::error(msg));
+                        }
+                    };
+                    match crate::db::list_views_with(&session, &keyspace).await {
+                        Ok(list) => {
+                            let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into());
+                            Ok(ToolOutput::text_content(json, None))
+                        }
+                        Err(err) => Ok(ToolOutput::text_content(
+                            format!("list_views failed: {}", err),
+                            None,
+                        )),
+                    }
+                }
+                "list_udts" => {
+                    let args = request.params.arguments.as_ref();
+                    let ks = args
+                        .and_then(|m| m.get("keyspace").and_then(|v| v.as_str()))
+                        .map(|s| s.to_string());
+                    if ks.is_none() {
+                        let msg = "missing required argument 'keyspace'".to_string();
+                        return Ok(ToolOutput::error(msg));
+                    }
+                    let keyspace = ks.unwrap();
+                    let span = tracing::info_span!("tool", name = "list_udts", %keyspace);
+                    let _g = span.enter();
+                    let session = match self.session().await {
+                        Ok(session) => session,
+                        Err(err) => {
+                            let msg = format!("list_udts failed to connect: {err}");
+                            return Ok(ToolOutput::error(msg));
+                        }
+                    };
+                    match crate::db::list_udts_with(&session, &keyspace).await {
+                        Ok(list) => {
+                            let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into());
+                            Ok(ToolOutput::text_content(json, None))
+                        }
+                        Err(err) => Ok(ToolOutput::text_content(
+                            format!("list_udts failed: {}", err),
+                            None,
+                        )),
+                    }
+                }
+                "list_functions" => {
+                    let args = request.params.arguments.as_ref();
+                    let ks = args
+                        .and_then(|m| m.get("keyspace").and_then(|v| v.as_str()))
+                        .map(|s| s.to_string());
+                    if ks.is_none() {
+                        let msg = "missing required argument 'keyspace'".to_string();
+                        return Ok(ToolOutput::error(msg));
+                    }
+                    let keyspace = ks.unwrap();
+                    let span = tracing::info_span!("tool", name = "list_functions", %keyspace);
+                    let _g = span.enter();
+                    let session = match self.session().await {
+                        Ok(session) => session,
+                        Err(err) => {
+                            let msg = format!("list_functions failed to connect: {err}");
+                            return Ok(ToolOutput::error(msg));
+                        }
+                    };
+                    match crate::db::list_functions_with(&session, &keyspace).await {
+                        Ok(list) => {
+                            let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into());
+                            Ok(ToolOutput::text_content(json, None))
+                        }
+                        Err(err) => Ok(ToolOutput::text_content(
+                            format!("list_functions failed: {}", err),
+                            None,
+                        )),
+                    }
+                }
+                "list_aggregates" => {
+                    let args = request.params.arguments.as_ref();
+                    let ks = args
+                        .and_then(|m| m.get("keyspace").and_then(|v| v.as_str()))
+                        .map(|s| s.to_string());
+                    if ks.is_none() {
+                        let msg = "missing required argument 'keyspace'".to_string();
+                        return Ok(ToolOutput::error(msg));
+                    }
+                    let keyspace = ks.unwrap();
+                    let span = tracing::info_span!("tool", name = "list_aggregates", %keyspace);
+                    let _g = span.enter();
+                    let session = match self.session().await {
+                        Ok(session) => session,
+                        Err(err) => {
+                            let msg = format!("list_aggregates failed to connect: {err}");
+                            return Ok(ToolOutput::error(msg));
+                        }
+                    };
+                    match crate::db::list_aggregates_with(&session, &keyspace).await {
+                        Ok(list) => {
+                            let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into());
+                            Ok(ToolOutput::text_content(json, None))
+                        }
+                        Err(err) => Ok(ToolOutput::text_content(
+                            format!("list_aggregates failed: {}", err),
+                            None,
+                        )),
+                    }
+                }
+                "size_estimates" => {
+                    let args = request.params.arguments.as_ref();
+                    let ks = args
+                        .and_then(|m| m.get("keyspace").and_then(|v| v.as_str()))
+                        .map(|s| s.to_string());
+                    let tb = args
+                        .and_then(|m| m.get("table").and_then(|v| v.as_str()))
+                        .map(|s| s.to_string());
+                    if ks.is_none() || tb.is_none() {
+                        let msg =
+                            "missing required arguments 'keyspace' and/or 'table'".to_string();
+                        return Ok(ToolOutput::error(msg));
+                    }
+                    let keyspace = ks.unwrap();
+                    let table = tb.unwrap();
+                    let span =
+                        tracing::info_span!("tool", name = "size_estimates", %keyspace, %table);
+                    let _g = span.enter();
+                    let session = match self.session().await {
+                        Ok(session) => session,
+                        Err(err) => {
+                            let msg = format!("size_estimates failed to connect: {err}");
+                            return Ok(ToolOutput::error(msg));
+                        }
+                    };
+                    match crate::db::size_estimates_with(&session, &keyspace, &table).await {
+                        Ok(obj) => {
+                            let json = serde_json::to_string(&obj).unwrap_or_else(|_| "[]".into());
+                            Ok(ToolOutput::text_content(json, None))
+                        }
+                        Err(err) => Ok(ToolOutput::text_content(
+                            format!("size_estimates failed: {}", err),
+                            None,
+                        )),
+                    }
+                }
+                "search_schema" => {
+                    let args = request.params.arguments.as_ref();
+                    let pattern = args
+                        .and_then(|m| m.get("pattern").and_then(|v| v.as_str()))
+                        .map(|s| s.to_string());
+                    let keyspace = args
+                        .and_then(|m| m.get("keyspace").and_then(|v| v.as_str()))
+                        .map(|s| s.to_string());
+                    if pattern.is_none() {
+                        let msg = "missing required argument 'pattern'".to_string();
+                        return Ok(ToolOutput::error(msg));
+                    }
+                    let pat = pattern.unwrap();
+                    let span = tracing::info_span!("tool", name = "search_schema", %pat, keyspace = keyspace.as_deref().unwrap_or("<all>"));
+                    let _g = span.enter();
+                    let session = match self.session().await {
+                        Ok(session) => session,
+                        Err(err) => {
+                            let msg = format!("search_schema failed to connect: {err}");
+                            return Ok(ToolOutput::error(msg));
+                        }
+                    };
+                    match crate::db::search_schema_with(&session, &pat, keyspace.as_deref()).await {
+                        Ok(items) => {
+                            let json =
+                                serde_json::to_string(&items).unwrap_or_else(|_| "[]".into());
+                            Ok(ToolOutput::text_content(json, None))
+                        }
+                        Err(err) => Ok(ToolOutput::text_content(
+                            format!("search_schema failed: {}", err),
+                            None,
+                        )),
+                    }
+                }
+                _ => {
+                    let msg = format!("tool '{}' is not yet implemented (read-only phase)", name);
+                    Ok(ToolOutput::error(msg))
+                }
+            }
         }
     }
 
@@ -327,7 +1164,7 @@ pub mod mcp {
     }
 
     #[async_trait::async_trait]
-    impl rust_mcp_sdk::mcp_server::ServerHandler for MinimalHandler {
+    impl rust_mcp_sdk::mcp_server::ServerHandler for ToolExecutor {
         async fn handle_list_tools_request(
             &self,
             _request: rust_mcp_schema::ListToolsRequest,
@@ -547,786 +1384,26 @@ pub mod mcp {
             rust_mcp_schema::CallToolResult,
             rust_mcp_schema::schema_utils::CallToolError,
         > {
-            // Ensure capability exists
             runtime
                 .assert_server_request_capabilities(&"tools/call".to_string())
                 .map_err(rust_mcp_schema::schema_utils::CallToolError::new)?;
 
-            let name = request.params.name;
-            match name.as_str() {
-                "list_keyspaces" => {
-                    let span = tracing::info_span!("tool", name = "list_keyspaces");
-                    let _g = span.enter();
-                    let session = match self.session().await {
-                        Ok(session) => session,
-                        Err(err) => {
-                            let msg = format!("list_keyspaces failed to connect: {err}");
-                            return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
-                        }
-                    };
-                    match crate::db::list_keyspaces_with(&session).await {
-                        Ok(list) => {
-                            let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into());
-                            Ok(rust_mcp_schema::CallToolResult::text_content(json, None))
-                        }
-                        Err(err) => {
-                            let msg = format!("list_keyspaces failed: {}", err);
-                            Ok(rust_mcp_schema::CallToolResult::text_content(msg, None))
-                        }
-                    }
-                }
-                "list_tables" => {
-                    // extract keyspace from arguments
-                    let ks = request.params.arguments.as_ref().and_then(|m| {
-                        m.get("keyspace")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                    });
-                    if ks.is_none() {
-                        let msg = "missing required argument 'keyspace'".to_string();
-                        return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
-                    }
-                    let keyspace = ks.unwrap();
-                    let span = tracing::info_span!("tool", name = "list_tables", %keyspace);
-                    let _g = span.enter();
-                    let session = match self.session().await {
-                        Ok(session) => session,
-                        Err(err) => {
-                            let msg = format!("list_tables failed to connect: {err}");
-                            return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
-                        }
-                    };
-                    match crate::db::list_tables_with(&session, &keyspace).await {
-                        Ok(list) => {
-                            let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into());
-                            Ok(rust_mcp_schema::CallToolResult::text_content(json, None))
-                        }
-                        Err(err) => {
-                            let msg = format!("list_tables failed: {}", err);
-                            Ok(rust_mcp_schema::CallToolResult::text_content(msg, None))
-                        }
-                    }
-                }
-                "describe_table" => {
-                    // extract keyspace and table from arguments
-                    let args = request.params.arguments.as_ref();
-                    let ks = args
-                        .and_then(|m| m.get("keyspace").and_then(|v| v.as_str()))
-                        .map(|s| s.to_string());
-                    let tb = args
-                        .and_then(|m| m.get("table").and_then(|v| v.as_str()))
-                        .map(|s| s.to_string());
-                    if ks.is_none() || tb.is_none() {
-                        let msg =
-                            "missing required arguments 'keyspace' and/or 'table'".to_string();
-                        return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
-                    }
-                    match self
-                        .get_schema(&ks.clone().unwrap(), &tb.clone().unwrap())
-                        .await
-                    {
-                        Ok(cols) => {
-                            let json = serde_json::to_string(&cols).unwrap_or_else(|_| "{}".into());
-                            Ok(rust_mcp_schema::CallToolResult::text_content(json, None))
-                        }
-                        Err(err) => {
-                            let msg = format!("describe_table failed: {}", err);
-                            Ok(rust_mcp_schema::CallToolResult::text_content(msg, None))
-                        }
-                    }
-                }
-                "sample_rows" => {
-                    let args = request.params.arguments.as_ref();
-                    let ks = args
-                        .and_then(|m| m.get("keyspace").and_then(|v| v.as_str()))
-                        .map(|s| s.to_string());
-                    let tb = args
-                        .and_then(|m| m.get("table").and_then(|v| v.as_str()))
-                        .map(|s| s.to_string());
-                    let lm = args.and_then(|m| m.get("limit").and_then(|v| v.as_u64()));
-                    let filters = args
-                        .and_then(|m| m.get("filters"))
-                        .and_then(|v| v.as_object());
-                    let Some((keyspace, table, limit_u64)) =
-                        ks.zip(tb).zip(lm).map(|((a, b), c)| (a, b, c))
-                    else {
-                        let msg = "missing required arguments 'keyspace', 'table', or 'limit'"
-                            .to_string();
-                        return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
-                    };
-                    // Validate filter keys exist
-                    if let Some(f) = filters {
-                        match self.get_schema(&keyspace, &table).await {
-                            Ok(schema) => {
-                                let available: std::collections::HashSet<String> = schema
-                                    .columns
-                                    .iter()
-                                    .map(|c| c.column_name.clone())
-                                    .collect();
-                                for col in f.keys() {
-                                    if !available.contains(col) {
-                                        let msg = format!(
-                                            "invalid filter column '{}'; not in table columns",
-                                            col
-                                        );
-                                        return Ok(rust_mcp_schema::CallToolResult::text_content(
-                                            msg, None,
-                                        ));
-                                    }
-                                }
-                            }
-                            Err(err) => {
-                                let msg = format!("schema fetch failed: {}", err);
-                                return Ok(rust_mcp_schema::CallToolResult::text_content(
-                                    msg, None,
-                                ));
-                            }
-                        }
-                    }
-                    let limit = (limit_u64 as u32).clamp(1, 500);
-                    let span = tracing::info_span!("tool", name = "sample_rows", %keyspace, %table, limit = limit as i64);
-                    let _g = span.enter();
-                    let session = match self.session().await {
-                        Ok(session) => session,
-                        Err(err) => {
-                            let msg = format!("sample_rows failed to connect: {err}");
-                            return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
-                        }
-                    };
-                    match crate::db::sample_rows_with(&session, &keyspace, &table, limit, filters)
-                        .await
-                    {
-                        Ok(rows) => {
-                            let json = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into());
-                            Ok(rust_mcp_schema::CallToolResult::text_content(json, None))
-                        }
-                        Err(err) => {
-                            let msg = format!("sample_rows failed: {}", err);
-                            Ok(rust_mcp_schema::CallToolResult::text_content(msg, None))
-                        }
-                    }
-                }
-                "select" => {
-                    let args = request.params.arguments.as_ref();
-                    let ks = args
-                        .and_then(|m| m.get("keyspace").and_then(|v| v.as_str()))
-                        .map(|s| s.to_string());
-                    let tb = args
-                        .and_then(|m| m.get("table").and_then(|v| v.as_str()))
-                        .map(|s| s.to_string());
-                    let cols =
-                        args.and_then(|m| m.get("columns").and_then(|v| v.as_array()).cloned());
-                    let lm = args.and_then(|m| m.get("limit").and_then(|v| v.as_u64()));
-                    let filters = args
-                        .and_then(|m| m.get("filters"))
-                        .and_then(|v| v.as_object());
-                    let order_by = args
-                        .and_then(|m| m.get("order_by").or_else(|| m.get("orderBy")))
-                        .and_then(|v| v.as_array().cloned());
-                    if ks.is_none() || tb.is_none() || cols.is_none() || lm.is_none() {
-                        let msg =
-                            "missing required arguments 'keyspace', 'table', 'columns', or 'limit'"
-                                .to_string();
-                        return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
-                    }
-                    let keyspace = ks.unwrap();
-                    let table = tb.unwrap();
-                    let columns: Vec<String> = cols
-                        .unwrap()
-                        .iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect();
-                    let limit = (lm.unwrap() as u32).clamp(1, 500);
-                    // Validate requested columns and filter keys exist
-                    match self.get_schema(&keyspace, &table).await {
-                        Ok(schema) => {
-                            let available: std::collections::HashSet<String> = schema
-                                .columns
-                                .iter()
-                                .map(|c| c.column_name.clone())
-                                .collect();
-                            for c in columns.iter() {
-                                if !available.contains(c) {
-                                    let msg = format!(
-                                        "invalid column '{}' in select; not in table columns",
-                                        c
-                                    );
-                                    return Ok(rust_mcp_schema::CallToolResult::text_content(
-                                        msg, None,
-                                    ));
-                                }
-                            }
-                            if let Some(f) = &filters {
-                                for col in f.keys() {
-                                    if !available.contains(col) {
-                                        let msg = format!(
-                                            "invalid filter column '{}'; not in table columns",
-                                            col
-                                        );
-                                        return Ok(rust_mcp_schema::CallToolResult::text_content(
-                                            msg, None,
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            let msg = format!("schema fetch failed: {}", err);
-                            return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
-                        }
-                    }
-                    let order_tuples: Option<Vec<(String, String)>> = order_by.map(|arr| {
-                        arr.into_iter()
-                            .filter_map(|item| item.as_object().cloned())
-                            .filter_map(|m| {
-                                let col = m.get("column").and_then(|v| v.as_str())?;
-                                let dir =
-                                    m.get("direction").and_then(|v| v.as_str()).unwrap_or("asc");
-                                Some((col.to_string(), dir.to_string()))
-                            })
-                            .collect()
-                    });
-                    // Enforce order_by only on clustering keys
-                    if let Some(ref ords) = order_tuples {
-                        match self.get_schema(&keyspace, &table).await {
-                            Ok(schema) => {
-                                let allowed: std::collections::HashSet<String> =
-                                    schema.clustering_keys.iter().cloned().collect();
-                                for (col, _) in ords.iter() {
-                                    if !allowed.contains(col) {
-                                        let msg = format!(
-                                            "invalid order_by column '{}'; only clustering keys are allowed: {:?}",
-                                            col, schema.clustering_keys
-                                        );
-                                        return Ok(rust_mcp_schema::CallToolResult::text_content(
-                                            msg, None,
-                                        ));
-                                    }
-                                }
-                            }
-                            Err(err) => {
-                                let msg = format!("schema fetch failed: {}", err);
-                                return Ok(rust_mcp_schema::CallToolResult::text_content(
-                                    msg, None,
-                                ));
-                            }
-                        }
-                    }
-                    let span = tracing::info_span!("tool", name = "select", %keyspace, %table, limit = limit as i64);
-                    let _g = span.enter();
-                    let session = match self.session().await {
-                        Ok(session) => session,
-                        Err(err) => {
-                            let msg = format!("select failed to connect: {err}");
-                            return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
-                        }
-                    };
-                    match crate::db::select_columns_with(
-                        &session,
-                        &keyspace,
-                        &table,
-                        &columns,
-                        limit,
-                        filters,
-                        order_tuples.as_ref(),
-                    )
-                    .await
-                    {
-                        Ok(rows) => {
-                            let json = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into());
-                            Ok(rust_mcp_schema::CallToolResult::text_content(json, None))
-                        }
-                        Err(err) => {
-                            let msg = format!("select failed: {}", err);
-                            Ok(rust_mcp_schema::CallToolResult::text_content(msg, None))
-                        }
-                    }
-                }
-                "paged_select" => {
-                    let args = request.params.arguments.as_ref();
-                    let ks = args
-                        .and_then(|m| m.get("keyspace").and_then(|v| v.as_str()))
-                        .map(|s| s.to_string());
-                    let tb = args
-                        .and_then(|m| m.get("table").and_then(|v| v.as_str()))
-                        .map(|s| s.to_string());
-                    let cols =
-                        args.and_then(|m| m.get("columns").and_then(|v| v.as_array()).cloned());
-                    let page_size = args.and_then(|m| m.get("page_size").and_then(|v| v.as_u64()));
-                    let filters = args
-                        .and_then(|m| m.get("filters"))
-                        .and_then(|v| v.as_object());
-                    let order_by = args
-                        .and_then(|m| m.get("order_by").or_else(|| m.get("orderBy")))
-                        .and_then(|v| v.as_array().cloned());
-                    let cursor = args
-                        .and_then(|m| m.get("cursor").and_then(|v| v.as_str()))
-                        .map(|s| s.to_string());
-                    if ks.is_none() || tb.is_none() || cols.is_none() || page_size.is_none() {
-                        let msg = "missing required arguments 'keyspace', 'table', 'columns', or 'page_size'".to_string();
-                        return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
-                    }
-                    let keyspace = ks.unwrap();
-                    let table = tb.unwrap();
-                    let page_size = (page_size.unwrap() as i32).clamp(1, 500);
-                    let columns: Vec<String> = cols
-                        .unwrap()
-                        .iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect();
-                    // Validate columns/filters and enforce order_by on clustering keys
-                    match self.get_schema(&keyspace, &table).await {
-                        Ok(schema) => {
-                            let available: std::collections::HashSet<String> = schema
-                                .columns
-                                .iter()
-                                .map(|c| c.column_name.clone())
-                                .collect();
-                            for c in columns.iter() {
-                                if !available.contains(c) {
-                                    return Ok(rust_mcp_schema::CallToolResult::text_content(
-                                        format!("invalid column '{}'", c),
-                                        None,
-                                    ));
-                                }
-                            }
-                            if let Some(f) = &filters {
-                                for col in f.keys() {
-                                    if !available.contains(col) {
-                                        return Ok(rust_mcp_schema::CallToolResult::text_content(
-                                            format!("invalid filter column '{}'", col),
-                                            None,
-                                        ));
-                                    }
-                                }
-                            }
-                            if let Some(arr) = &order_by {
-                                let allowed: std::collections::HashSet<String> =
-                                    schema.clustering_keys.iter().cloned().collect();
-                                for item in arr.iter().filter_map(|v| v.as_object()) {
-                                    let Some(col) = item.get("column").and_then(|v| v.as_str())
-                                    else {
-                                        continue;
-                                    };
-                                    if !allowed.contains(col) {
-                                        return Ok(rust_mcp_schema::CallToolResult::text_content(
-                                            format!("invalid order_by column '{}'", col),
-                                            None,
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            return Ok(rust_mcp_schema::CallToolResult::text_content(
-                                format!("schema fetch failed: {}", err),
-                                None,
-                            ));
-                        }
-                    }
-                    let order_tuples: Option<Vec<(String, String)>> = order_by.map(|arr| {
-                        arr.into_iter()
-                            .filter_map(|item| item.as_object().cloned())
-                            .filter_map(|m| {
-                                let col = m.get("column").and_then(|v| v.as_str())?;
-                                let dir =
-                                    m.get("direction").and_then(|v| v.as_str()).unwrap_or("asc");
-                                Some((col.to_string(), dir.to_string()))
-                            })
-                            .collect()
-                    });
-                    let span = tracing::info_span!("tool", name = "paged_select", %keyspace, %table, page_size);
-                    let _g = span.enter();
-                    let session = match self.session().await {
-                        Ok(session) => session,
-                        Err(err) => {
-                            let msg = format!("paged_select failed to connect: {err}");
-                            return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
-                        }
-                    };
-                    match crate::db::paged_select_with(
-                        &session,
-                        &keyspace,
-                        &table,
-                        &columns,
-                        page_size,
-                        filters,
-                        order_tuples.as_ref(),
-                        cursor.as_deref(),
-                    )
-                    .await
-                    {
-                        Ok(obj) => {
-                            let json = serde_json::to_string(&obj).unwrap_or_else(|_| "{}".into());
-                            Ok(rust_mcp_schema::CallToolResult::text_content(json, None))
-                        }
-                        Err(err) => Ok(rust_mcp_schema::CallToolResult::text_content(
-                            format!("paged_select failed: {}", err),
-                            None,
-                        )),
-                    }
-                }
-                "partition_rows" => {
-                    let args = request.params.arguments.as_ref();
-                    let ks = args
-                        .and_then(|m| m.get("keyspace").and_then(|v| v.as_str()))
-                        .map(|s| s.to_string());
-                    let tb = args
-                        .and_then(|m| m.get("table").and_then(|v| v.as_str()))
-                        .map(|s| s.to_string());
-                    let part = args
-                        .and_then(|m| m.get("partition"))
-                        .and_then(|v| v.as_object());
-                    let limit = args
-                        .and_then(|m| m.get("limit").and_then(|v| v.as_u64()))
-                        .map(|n| (n as u32).clamp(1, 500));
-                    if ks.is_none() || tb.is_none() || part.is_none() || limit.is_none() {
-                        let msg =
-                            "missing required arguments 'keyspace','table','partition','limit'"
-                                .to_string();
-                        return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
-                    }
-                    let keyspace = ks.unwrap();
-                    let table = tb.unwrap();
-                    let partition = part.unwrap();
-                    let limit = limit.unwrap();
-                    // Validate exact partition key set against schema (no extras, no missing)
-                    match self.get_schema(&keyspace, &table).await {
-                        Ok(schema) => {
-                            let pk: std::collections::HashSet<String> =
-                                schema.partition_keys.iter().cloned().collect();
-                            let provided: std::collections::HashSet<String> =
-                                partition.keys().cloned().collect();
-                            if pk != provided {
-                                let msg = format!(
-                                    "partition keys mismatch: expected {:?}",
-                                    schema.partition_keys
-                                );
-                                return Ok(rust_mcp_schema::CallToolResult::text_content(
-                                    msg, None,
-                                ));
-                            }
-                        }
-                        Err(err) => {
-                            return Ok(rust_mcp_schema::CallToolResult::text_content(
-                                format!("schema fetch failed: {}", err),
-                                None,
-                            ));
-                        }
-                    }
-                    let span = tracing::info_span!("tool", name = "partition_rows", %keyspace, %table, limit = limit as i64);
-                    let _g = span.enter();
-                    let session = match self.session().await {
-                        Ok(session) => session,
-                        Err(err) => {
-                            let msg = format!("partition_rows failed to connect: {err}");
-                            return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
-                        }
-                    };
-                    match crate::db::partition_rows_with(
-                        &session, &keyspace, &table, partition, limit,
-                    )
-                    .await
-                    {
-                        Ok(rows) => {
-                            let json = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into());
-                            Ok(rust_mcp_schema::CallToolResult::text_content(json, None))
-                        }
-                        Err(err) => Ok(rust_mcp_schema::CallToolResult::text_content(
-                            format!("partition_rows failed: {}", err),
-                            None,
-                        )),
-                    }
-                }
-                "cluster_topology" => {
-                    let span = tracing::info_span!("tool", name = "cluster_topology");
-                    let _g = span.enter();
-                    let session = match self.session().await {
-                        Ok(session) => session,
-                        Err(err) => {
-                            let msg = format!("cluster_topology failed to connect: {err}");
-                            return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
-                        }
-                    };
-                    match crate::db::cluster_topology_with(&session).await {
-                        Ok(nodes) => {
-                            let json =
-                                serde_json::to_string(&nodes).unwrap_or_else(|_| "[]".into());
-                            Ok(rust_mcp_schema::CallToolResult::text_content(json, None))
-                        }
-                        Err(err) => {
-                            let msg = format!("cluster_topology failed: {}", err);
-                            Ok(rust_mcp_schema::CallToolResult::text_content(msg, None))
-                        }
-                    }
-                }
-                "list_indexes" => {
-                    let args = request.params.arguments.as_ref();
-                    let ks = args
-                        .and_then(|m| m.get("keyspace").and_then(|v| v.as_str()))
-                        .map(|s| s.to_string());
-                    let tb = args
-                        .and_then(|m| m.get("table").and_then(|v| v.as_str()))
-                        .map(|s| s.to_string());
-                    if ks.is_none() || tb.is_none() {
-                        let msg =
-                            "missing required arguments 'keyspace' and/or 'table'".to_string();
-                        return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
-                    }
-                    let keyspace = ks.unwrap();
-                    let table = tb.unwrap();
-                    let span =
-                        tracing::info_span!("tool", name = "list_indexes", %keyspace, %table);
-                    let _g = span.enter();
-                    let session = match self.session().await {
-                        Ok(session) => session,
-                        Err(err) => {
-                            let msg = format!("list_indexes failed to connect: {err}");
-                            return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
-                        }
-                    };
-                    match crate::db::list_indexes_with(&session, &keyspace, &table).await {
-                        Ok(list) => {
-                            let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into());
-                            Ok(rust_mcp_schema::CallToolResult::text_content(json, None))
-                        }
-                        Err(err) => {
-                            let msg = format!("list_indexes failed: {}", err);
-                            Ok(rust_mcp_schema::CallToolResult::text_content(msg, None))
-                        }
-                    }
-                }
-                "keyspace_replication" => {
-                    let args = request.params.arguments.as_ref();
-                    let ks = args
-                        .and_then(|m| m.get("keyspace").and_then(|v| v.as_str()))
-                        .map(|s| s.to_string());
-                    if ks.is_none() {
-                        let msg = "missing required argument 'keyspace'".to_string();
-                        return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
-                    }
-                    let keyspace = ks.unwrap();
-                    let span =
-                        tracing::info_span!("tool", name = "keyspace_replication", %keyspace);
-                    let _g = span.enter();
-                    let session = match self.session().await {
-                        Ok(session) => session,
-                        Err(err) => {
-                            let msg = format!("keyspace_replication failed to connect: {err}");
-                            return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
-                        }
-                    };
-                    match crate::db::keyspace_replication_with(&session, &keyspace).await {
-                        Ok(obj) => {
-                            let json = serde_json::to_string(&obj).unwrap_or_else(|_| "{}".into());
-                            Ok(rust_mcp_schema::CallToolResult::text_content(json, None))
-                        }
-                        Err(err) => {
-                            let msg = format!("keyspace_replication failed: {}", err);
-                            Ok(rust_mcp_schema::CallToolResult::text_content(msg, None))
-                        }
-                    }
-                }
-                "list_views" => {
-                    let args = request.params.arguments.as_ref();
-                    let ks = args
-                        .and_then(|m| m.get("keyspace").and_then(|v| v.as_str()))
-                        .map(|s| s.to_string());
-                    if ks.is_none() {
-                        let msg = "missing required argument 'keyspace'".to_string();
-                        return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
-                    }
-                    let keyspace = ks.unwrap();
-                    let span = tracing::info_span!("tool", name = "list_views", %keyspace);
-                    let _g = span.enter();
-                    let session = match self.session().await {
-                        Ok(session) => session,
-                        Err(err) => {
-                            let msg = format!("list_views failed to connect: {err}");
-                            return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
-                        }
-                    };
-                    match crate::db::list_views_with(&session, &keyspace).await {
-                        Ok(list) => {
-                            let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into());
-                            Ok(rust_mcp_schema::CallToolResult::text_content(json, None))
-                        }
-                        Err(err) => Ok(rust_mcp_schema::CallToolResult::text_content(
-                            format!("list_views failed: {}", err),
-                            None,
-                        )),
-                    }
-                }
-                "list_udts" => {
-                    let args = request.params.arguments.as_ref();
-                    let ks = args
-                        .and_then(|m| m.get("keyspace").and_then(|v| v.as_str()))
-                        .map(|s| s.to_string());
-                    if ks.is_none() {
-                        let msg = "missing required argument 'keyspace'".to_string();
-                        return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
-                    }
-                    let keyspace = ks.unwrap();
-                    let span = tracing::info_span!("tool", name = "list_udts", %keyspace);
-                    let _g = span.enter();
-                    let session = match self.session().await {
-                        Ok(session) => session,
-                        Err(err) => {
-                            let msg = format!("list_udts failed to connect: {err}");
-                            return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
-                        }
-                    };
-                    match crate::db::list_udts_with(&session, &keyspace).await {
-                        Ok(list) => {
-                            let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into());
-                            Ok(rust_mcp_schema::CallToolResult::text_content(json, None))
-                        }
-                        Err(err) => Ok(rust_mcp_schema::CallToolResult::text_content(
-                            format!("list_udts failed: {}", err),
-                            None,
-                        )),
-                    }
-                }
-                "list_functions" => {
-                    let args = request.params.arguments.as_ref();
-                    let ks = args
-                        .and_then(|m| m.get("keyspace").and_then(|v| v.as_str()))
-                        .map(|s| s.to_string());
-                    if ks.is_none() {
-                        let msg = "missing required argument 'keyspace'".to_string();
-                        return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
-                    }
-                    let keyspace = ks.unwrap();
-                    let span = tracing::info_span!("tool", name = "list_functions", %keyspace);
-                    let _g = span.enter();
-                    let session = match self.session().await {
-                        Ok(session) => session,
-                        Err(err) => {
-                            let msg = format!("list_functions failed to connect: {err}");
-                            return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
-                        }
-                    };
-                    match crate::db::list_functions_with(&session, &keyspace).await {
-                        Ok(list) => {
-                            let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into());
-                            Ok(rust_mcp_schema::CallToolResult::text_content(json, None))
-                        }
-                        Err(err) => Ok(rust_mcp_schema::CallToolResult::text_content(
-                            format!("list_functions failed: {}", err),
-                            None,
-                        )),
-                    }
-                }
-                "list_aggregates" => {
-                    let args = request.params.arguments.as_ref();
-                    let ks = args
-                        .and_then(|m| m.get("keyspace").and_then(|v| v.as_str()))
-                        .map(|s| s.to_string());
-                    if ks.is_none() {
-                        let msg = "missing required argument 'keyspace'".to_string();
-                        return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
-                    }
-                    let keyspace = ks.unwrap();
-                    let span = tracing::info_span!("tool", name = "list_aggregates", %keyspace);
-                    let _g = span.enter();
-                    let session = match self.session().await {
-                        Ok(session) => session,
-                        Err(err) => {
-                            let msg = format!("list_aggregates failed to connect: {err}");
-                            return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
-                        }
-                    };
-                    match crate::db::list_aggregates_with(&session, &keyspace).await {
-                        Ok(list) => {
-                            let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into());
-                            Ok(rust_mcp_schema::CallToolResult::text_content(json, None))
-                        }
-                        Err(err) => Ok(rust_mcp_schema::CallToolResult::text_content(
-                            format!("list_aggregates failed: {}", err),
-                            None,
-                        )),
-                    }
-                }
-                "size_estimates" => {
-                    let args = request.params.arguments.as_ref();
-                    let ks = args
-                        .and_then(|m| m.get("keyspace").and_then(|v| v.as_str()))
-                        .map(|s| s.to_string());
-                    let tb = args
-                        .and_then(|m| m.get("table").and_then(|v| v.as_str()))
-                        .map(|s| s.to_string());
-                    if ks.is_none() || tb.is_none() {
-                        let msg =
-                            "missing required arguments 'keyspace' and/or 'table'".to_string();
-                        return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
-                    }
-                    let keyspace = ks.unwrap();
-                    let table = tb.unwrap();
-                    let span =
-                        tracing::info_span!("tool", name = "size_estimates", %keyspace, %table);
-                    let _g = span.enter();
-                    let session = match self.session().await {
-                        Ok(session) => session,
-                        Err(err) => {
-                            let msg = format!("size_estimates failed to connect: {err}");
-                            return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
-                        }
-                    };
-                    match crate::db::size_estimates_with(&session, &keyspace, &table).await {
-                        Ok(obj) => {
-                            let json = serde_json::to_string(&obj).unwrap_or_else(|_| "[]".into());
-                            Ok(rust_mcp_schema::CallToolResult::text_content(json, None))
-                        }
-                        Err(err) => Ok(rust_mcp_schema::CallToolResult::text_content(
-                            format!("size_estimates failed: {}", err),
-                            None,
-                        )),
-                    }
-                }
-                "search_schema" => {
-                    let args = request.params.arguments.as_ref();
-                    let pattern = args
-                        .and_then(|m| m.get("pattern").and_then(|v| v.as_str()))
-                        .map(|s| s.to_string());
-                    let keyspace = args
-                        .and_then(|m| m.get("keyspace").and_then(|v| v.as_str()))
-                        .map(|s| s.to_string());
-                    if pattern.is_none() {
-                        let msg = "missing required argument 'pattern'".to_string();
-                        return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
-                    }
-                    let pat = pattern.unwrap();
-                    let span = tracing::info_span!("tool", name = "search_schema", %pat, keyspace = keyspace.as_deref().unwrap_or("<all>"));
-                    let _g = span.enter();
-                    let session = match self.session().await {
-                        Ok(session) => session,
-                        Err(err) => {
-                            let msg = format!("search_schema failed to connect: {err}");
-                            return Ok(rust_mcp_schema::CallToolResult::text_content(msg, None));
-                        }
-                    };
-                    match crate::db::search_schema_with(&session, &pat, keyspace.as_deref()).await {
-                        Ok(items) => {
-                            let json =
-                                serde_json::to_string(&items).unwrap_or_else(|_| "[]".into());
-                            Ok(rust_mcp_schema::CallToolResult::text_content(json, None))
-                        }
-                        Err(err) => Ok(rust_mcp_schema::CallToolResult::text_content(
-                            format!("search_schema failed: {}", err),
-                            None,
-                        )),
-                    }
-                }
-                _ => {
-                    let msg = format!("tool '{}' is not yet implemented (read-only phase)", name);
-                    Ok(rust_mcp_schema::CallToolResult::text_content(msg, None))
-                }
-            }
+            let output = self
+                .execute(
+                    request.params.name.as_str(),
+                    request.params.arguments.as_ref(),
+                )
+                .await;
+
+            let mut result = rust_mcp_schema::CallToolResult::text_content(output.text, None);
+            result.is_error = Some(output.is_error);
+            Ok(result)
         }
     }
 }
 
 pub mod rmcp_server {
+    use crate::mcp::ToolExecutor;
     use crate::server;
     use anyhow::Result;
     use rmcp::{
@@ -1338,7 +1415,17 @@ pub mod rmcp_server {
     use tracing_subscriber::EnvFilter;
 
     #[derive(Clone)]
-    struct BridgeHandler;
+    struct BridgeHandler {
+        executor: Arc<ToolExecutor>,
+    }
+
+    impl BridgeHandler {
+        fn new() -> Self {
+            let executor = Arc::new(ToolExecutor::from_env());
+            executor.warmup_connection();
+            Self { executor }
+        }
+    }
 
     impl ServerHandler for BridgeHandler {
         fn get_info(&self) -> ServerInfo {
@@ -1371,16 +1458,20 @@ pub mod rmcp_server {
             Ok(ListToolsResult::with_all_items(items))
         }
 
-        // Until we migrate each tool, return unknown tool error so handshake and discovery work.
         async fn call_tool(
             &self,
             request: CallToolRequestParam,
             _ctx: RequestContext<RoleServer>,
         ) -> Result<CallToolResult, rmcp::ErrorData> {
-            Err(ErrorData::invalid_request(
-                "unknown_tool",
-                Some(serde_json::json!({ "name": request.name })),
-            ))
+            let output = self
+                .executor
+                .execute(request.name.as_ref(), request.arguments.as_ref())
+                .await;
+            if output.is_error {
+                Ok(CallToolResult::error(vec![Content::text(output.text)]))
+            } else {
+                Ok(CallToolResult::success(vec![Content::text(output.text)]))
+            }
         }
     }
 
@@ -1401,7 +1492,7 @@ pub mod rmcp_server {
         info!("starting MCP stdio server (rmcp, Content-Length)");
 
         // Start RMCP stdio (Content-Length framing)
-        let handler = BridgeHandler;
+        let handler = BridgeHandler::new();
         let service = handler.serve(stdio()).await?;
         // Wait for client disconnect
         service.waiting().await?;
