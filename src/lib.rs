@@ -21,6 +21,8 @@ pub mod schema {
 }
 
 pub mod server {
+    use serde_json::{json, Map, Value};
+
     #[derive(Debug, Clone, PartialEq)]
     pub struct ServerInfo {
         pub name: &'static str,
@@ -111,6 +113,147 @@ pub mod server {
             },
         ]
     }
+
+    pub fn tool_input_schema(name: &str) -> Value {
+        let mut required: Vec<String> = Vec::new();
+        let mut props = Map::new();
+
+        let string_field = |description: &str| {
+            json!({
+                "type": "string",
+                "description": description,
+            })
+        };
+        let integer_field = |minimum: i64, maximum: i64| {
+            json!({
+                "type": "integer",
+                "minimum": minimum,
+                "maximum": maximum,
+            })
+        };
+
+        match name {
+            "list_tables" => {
+                required.push("keyspace".into());
+                props.insert("keyspace".into(), string_field("Keyspace name"));
+            }
+            "describe_table" | "list_indexes" | "size_estimates" => {
+                required.extend(["keyspace".into(), "table".into()]);
+                props.insert("keyspace".into(), string_field("Keyspace name"));
+                props.insert("table".into(), string_field("Table name"));
+            }
+            "sample_rows" => {
+                required.extend(["keyspace".into(), "table".into(), "limit".into()]);
+                props.insert("keyspace".into(), string_field("Keyspace name"));
+                props.insert("table".into(), string_field("Table name"));
+                props.insert("limit".into(), integer_field(1, 500));
+                props.insert("filters".into(), json!({ "type": "object" }));
+            }
+            "partition_rows" => {
+                required.extend([
+                    "keyspace".into(),
+                    "table".into(),
+                    "partition".into(),
+                    "limit".into(),
+                ]);
+                props.insert("keyspace".into(), string_field("Keyspace name"));
+                props.insert("table".into(), string_field("Table name"));
+                props.insert(
+                    "partition".into(),
+                    json!({
+                        "type": "object",
+                        "description": "Map of partition key column -> value",
+                    }),
+                );
+                props.insert("limit".into(), integer_field(1, 500));
+            }
+            "select" => {
+                required.extend([
+                    "keyspace".into(),
+                    "table".into(),
+                    "columns".into(),
+                    "limit".into(),
+                ]);
+                props.insert("keyspace".into(), string_field("Keyspace name"));
+                props.insert("table".into(), string_field("Table name"));
+                props.insert("columns".into(), json!({ "type": "array" }));
+                props.insert("limit".into(), integer_field(1, 500));
+                props.insert("filters".into(), json!({ "type": "object" }));
+                props.insert("order_by".into(), json!({ "type": "array" }));
+            }
+            "paged_select" => {
+                required.extend([
+                    "keyspace".into(),
+                    "table".into(),
+                    "columns".into(),
+                    "page_size".into(),
+                ]);
+                props.insert("keyspace".into(), string_field("Keyspace name"));
+                props.insert("table".into(), string_field("Table name"));
+                props.insert("columns".into(), json!({ "type": "array" }));
+                props.insert("page_size".into(), integer_field(1, 500));
+                props.insert("filters".into(), json!({ "type": "object" }));
+                props.insert("order_by".into(), json!({ "type": "array" }));
+                props.insert("cursor".into(), json!({ "type": "string" }));
+            }
+            "keyspace_replication"
+            | "list_views"
+            | "list_udts"
+            | "list_functions"
+            | "list_aggregates" => {
+                required.push("keyspace".into());
+                props.insert("keyspace".into(), string_field("Keyspace name"));
+            }
+            "search_schema" => {
+                required.push("pattern".into());
+                props.insert(
+                    "pattern".into(),
+                    json!({
+                        "type": "string",
+                        "description": "Substring to search (case-insensitive)",
+                    }),
+                );
+                props.insert(
+                    "keyspace".into(),
+                    json!({
+                        "type": "string",
+                        "description": "Optional keyspace to scope search",
+                    }),
+                );
+            }
+            _ => {}
+        }
+
+        json!({
+            "type": "object",
+            "properties": props,
+            "required": required,
+        })
+    }
+}
+
+pub mod logging {
+    use std::sync::OnceLock;
+    use tracing_subscriber::EnvFilter;
+
+    static LOGGING_INIT: OnceLock<()> = OnceLock::new();
+
+    pub fn init_tracing() {
+        LOGGING_INIT.get_or_init(|| {
+            let filter = EnvFilter::try_from_default_env().ok().or_else(|| {
+                std::env::var("MCP_SERVER_LOG")
+                    .ok()
+                    .and_then(|value| EnvFilter::try_new(value).ok())
+            });
+
+            if let Some(filter) = filter {
+                let _ = tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_writer(std::io::stderr)
+                    .try_init();
+            }
+        });
+    }
 }
 
 pub mod mcp {
@@ -118,15 +261,10 @@ pub mod mcp {
     use rust_mcp_sdk::error::SdkResult;
     use std::sync::Arc;
     use tokio::sync::OnceCell;
-    use tracing::{error, info, Level};
-    use tracing_subscriber::EnvFilter;
+    use tracing::{error, info};
 
     pub async fn run_stdio_server() -> SdkResult<()> {
-        // Route logs to stderr so stdout remains a clean MCP transport channel.
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::from_default_env().add_directive(Level::INFO.into()))
-            .with_writer(std::io::stderr)
-            .try_init();
+        crate::logging::init_tracing();
 
         info!("starting MCP stdio server (rust-mcp-sdk)");
         use rust_mcp_schema::{
@@ -231,6 +369,12 @@ pub mod mcp {
         }
 
         pub(crate) fn warmup_connection(&self) {
+            let enabled = std::env::var("SCYLLA_WARMUP_ON_START")
+                .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+                .unwrap_or(false);
+            if !enabled {
+                return;
+            }
             let session_state = Arc::clone(&self.session_state);
             tokio::spawn(async move {
                 if let Err(err) = session_state.session().await {
@@ -1175,195 +1319,34 @@ pub mod mcp {
             runtime.assert_server_request_capabilities(&"tools/list".to_string())?;
 
             use rust_mcp_schema::{ListToolsResult, Tool, ToolInputSchema};
-            use serde_json::{Map, Value};
-            use std::collections::HashMap;
             // Map internal tool list to MCP schema
             let tools = crate::server::list_tools()
                 .into_iter()
                 .map(|t| {
-                    let mut required: Vec<String> = Vec::new();
-                    let mut props: HashMap<String, Map<String, Value>> = HashMap::new();
-                    if t.name == "list_tables" {
-                        required.push("keyspace".into());
-                        let mut keyspace_schema = Map::new();
-                        keyspace_schema.insert("type".into(), Value::String("string".into()));
-                        keyspace_schema
-                            .insert("description".into(), Value::String("Keyspace name".into()));
-                        props.insert("keyspace".into(), keyspace_schema);
-                    } else if t.name == "describe_table" {
-                        required.push("keyspace".into());
-                        required.push("table".into());
-                        let mut ks = Map::new();
-                        ks.insert("type".into(), Value::String("string".into()));
-                        ks.insert("description".into(), Value::String("Keyspace name".into()));
-                        props.insert("keyspace".into(), ks);
-                        let mut tb = Map::new();
-                        tb.insert("type".into(), Value::String("string".into()));
-                        tb.insert("description".into(), Value::String("Table name".into()));
-                        props.insert("table".into(), tb);
-                    } else if t.name == "sample_rows" {
-                        required.extend(["keyspace".into(), "table".into(), "limit".into()]);
-                        let mut ks = Map::new();
-                        ks.insert("type".into(), Value::String("string".into()));
-                        ks.insert("description".into(), Value::String("Keyspace name".into()));
-                        props.insert("keyspace".into(), ks);
-                        let mut tb = Map::new();
-                        tb.insert("type".into(), Value::String("string".into()));
-                        tb.insert("description".into(), Value::String("Table name".into()));
-                        props.insert("table".into(), tb);
-                        let mut lm = Map::new();
-                        lm.insert("type".into(), Value::String("integer".into()));
-                        lm.insert("minimum".into(), Value::from(1));
-                        lm.insert("maximum".into(), Value::from(500));
-                        props.insert("limit".into(), lm);
-                        // optional filters: object<string, any>
-                        let mut fl = Map::new();
-                        fl.insert("type".into(), Value::String("object".into()));
-                        props.insert("filters".into(), fl);
-                    } else if t.name == "partition_rows" {
-                        required.extend([
-                            "keyspace".into(),
-                            "table".into(),
-                            "partition".into(),
-                            "limit".into(),
-                        ]);
-                        let mut ks = Map::new();
-                        ks.insert("type".into(), Value::String("string".into()));
-                        ks.insert("description".into(), Value::String("Keyspace name".into()));
-                        props.insert("keyspace".into(), ks);
-                        let mut tb = Map::new();
-                        tb.insert("type".into(), Value::String("string".into()));
-                        tb.insert("description".into(), Value::String("Table name".into()));
-                        props.insert("table".into(), tb);
-                        let mut pk = Map::new();
-                        pk.insert("type".into(), Value::String("object".into()));
-                        pk.insert(
-                            "description".into(),
-                            Value::String("Map of partition key column -> value".into()),
-                        );
-                        props.insert("partition".into(), pk);
-                        let mut lm = Map::new();
-                        lm.insert("type".into(), Value::String("integer".into()));
-                        lm.insert("minimum".into(), Value::from(1));
-                        lm.insert("maximum".into(), Value::from(500));
-                        props.insert("limit".into(), lm);
-                    } else if t.name == "select" {
-                        required.extend([
-                            "keyspace".into(),
-                            "table".into(),
-                            "columns".into(),
-                            "limit".into(),
-                        ]);
-                        let mut ks = Map::new();
-                        ks.insert("type".into(), Value::String("string".into()));
-                        ks.insert("description".into(), Value::String("Keyspace name".into()));
-                        props.insert("keyspace".into(), ks);
-                        let mut tb = Map::new();
-                        tb.insert("type".into(), Value::String("string".into()));
-                        tb.insert("description".into(), Value::String("Table name".into()));
-                        props.insert("table".into(), tb);
-                        let mut cols = Map::new();
-                        cols.insert("type".into(), Value::String("array".into()));
-                        props.insert("columns".into(), cols);
-                        let mut lm = Map::new();
-                        lm.insert("type".into(), Value::String("integer".into()));
-                        lm.insert("minimum".into(), Value::from(1));
-                        lm.insert("maximum".into(), Value::from(500));
-                        props.insert("limit".into(), lm);
-                        let mut fl = Map::new();
-                        fl.insert("type".into(), Value::String("object".into()));
-                        props.insert("filters".into(), fl);
-                        // order_by: [{ column: string, direction: string }]
-                        let mut ob = Map::new();
-                        ob.insert("type".into(), Value::String("array".into()));
-                        props.insert("order_by".into(), ob);
-                    } else if t.name == "paged_select" {
-                        required.extend([
-                            "keyspace".into(),
-                            "table".into(),
-                            "columns".into(),
-                            "page_size".into(),
-                        ]);
-                        let mut ks = Map::new();
-                        ks.insert("type".into(), Value::String("string".into()));
-                        ks.insert("description".into(), Value::String("Keyspace name".into()));
-                        props.insert("keyspace".into(), ks);
-                        let mut tb = Map::new();
-                        tb.insert("type".into(), Value::String("string".into()));
-                        tb.insert("description".into(), Value::String("Table name".into()));
-                        props.insert("table".into(), tb);
-                        let mut cols = Map::new();
-                        cols.insert("type".into(), Value::String("array".into()));
-                        props.insert("columns".into(), cols);
-                        let mut ps = Map::new();
-                        ps.insert("type".into(), Value::String("integer".into()));
-                        ps.insert("minimum".into(), Value::from(1));
-                        ps.insert("maximum".into(), Value::from(500));
-                        props.insert("page_size".into(), ps);
-                        let mut fl = Map::new();
-                        fl.insert("type".into(), Value::String("object".into()));
-                        props.insert("filters".into(), fl);
-                        let mut ob = Map::new();
-                        ob.insert("type".into(), Value::String("array".into()));
-                        props.insert("order_by".into(), ob);
-                        let mut cur = Map::new();
-                        cur.insert("type".into(), Value::String("string".into()));
-                        props.insert("cursor".into(), cur);
-                    } else if t.name == "cluster_topology" {
-                        // no args
-                    } else if t.name == "list_indexes" {
-                        required.extend(["keyspace".into(), "table".into()]);
-                        let mut ks = Map::new();
-                        ks.insert("type".into(), Value::String("string".into()));
-                        ks.insert("description".into(), Value::String("Keyspace name".into()));
-                        props.insert("keyspace".into(), ks);
-                        let mut tb = Map::new();
-                        tb.insert("type".into(), Value::String("string".into()));
-                        tb.insert("description".into(), Value::String("Table name".into()));
-                        props.insert("table".into(), tb);
-                    } else if matches!(
-                        t.name,
-                        "keyspace_replication"
-                            | "list_views"
-                            | "list_udts"
-                            | "list_functions"
-                            | "list_aggregates"
-                    ) {
-                        required.push("keyspace".into());
-                        let mut ks = Map::new();
-                        ks.insert("type".into(), Value::String("string".into()));
-                        ks.insert("description".into(), Value::String("Keyspace name".into()));
-                        props.insert("keyspace".into(), ks);
-                    } else if t.name == "size_estimates" {
-                        required.extend(["keyspace".into(), "table".into()]);
-                        let mut ks = Map::new();
-                        ks.insert("type".into(), Value::String("string".into()));
-                        ks.insert("description".into(), Value::String("Keyspace name".into()));
-                        props.insert("keyspace".into(), ks);
-                        let mut tb = Map::new();
-                        tb.insert("type".into(), Value::String("string".into()));
-                        tb.insert("description".into(), Value::String("Table name".into()));
-                        props.insert("table".into(), tb);
-                    } else if t.name == "search_schema" {
-                        required.push("pattern".into());
-                        let mut pat = Map::new();
-                        pat.insert("type".into(), Value::String("string".into()));
-                        pat.insert(
-                            "description".into(),
-                            Value::String("Substring to search (case-insensitive)".into()),
-                        );
-                        props.insert("pattern".into(), pat);
-                        let mut ks = Map::new();
-                        ks.insert("type".into(), Value::String("string".into()));
-                        ks.insert(
-                            "description".into(),
-                            Value::String("Optional keyspace to scope search".into()),
-                        );
-                        props.insert("keyspace".into(), ks);
-                    }
+                    let schema = crate::server::tool_input_schema(t.name);
+                    let required = schema
+                        .get("required")
+                        .and_then(|value| value.as_array())
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let props = schema
+                        .get("properties")
+                        .and_then(|value| value.as_object())
+                        .map(|map| {
+                            map.iter()
+                                .filter_map(|(key, value)| {
+                                    value.as_object().map(|value| (key.clone(), value.clone()))
+                                })
+                                .collect()
+                        });
                     Tool {
                         description: Some(t.description.to_string()),
-                        input_schema: ToolInputSchema::new(required, Some(props)),
+                        input_schema: ToolInputSchema::new(required, props),
                         name: t.name.to_string(),
                     }
                 })
@@ -1411,8 +1394,7 @@ pub mod rmcp_server {
     };
     use std::borrow::Cow;
     use std::sync::Arc;
-    use tracing::{info, Level};
-    use tracing_subscriber::EnvFilter;
+    use tracing::info;
 
     #[derive(Clone)]
     struct BridgeHandler {
@@ -1450,7 +1432,12 @@ pub mod rmcp_server {
                 .map(|t| Tool {
                     name: Cow::Owned(t.name.to_string()),
                     description: Some(Cow::Owned(t.description.to_string())),
-                    input_schema: Arc::new(json_schema_empty_object()),
+                    input_schema: Arc::new(
+                        crate::server::tool_input_schema(t.name)
+                            .as_object()
+                            .cloned()
+                            .unwrap_or_default(),
+                    ),
                     output_schema: None,
                     annotations: None,
                 })
@@ -1475,28 +1462,287 @@ pub mod rmcp_server {
         }
     }
 
-    fn json_schema_empty_object() -> serde_json::Map<String, serde_json::Value> {
-        use serde_json::{json, Map, Value};
-        let mut schema = Map::new();
-        schema.insert("type".into(), Value::String("object".into()));
-        schema.insert("properties".into(), json!({}));
-        schema
-    }
-
     pub async fn run_stdio_server() -> Result<()> {
-        // Route logs to stderr so stdout remains a clean MCP transport channel.
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::from_default_env().add_directive(Level::INFO.into()))
-            .with_writer(std::io::stderr)
-            .try_init();
-        info!("starting MCP stdio server (rmcp, Content-Length)");
+        crate::logging::init_tracing();
+        info!("starting MCP stdio server (rmcp, newline-delimited JSON)");
 
-        // Start RMCP stdio (Content-Length framing)
+        // RMCP 0.5 stdio uses newline-delimited JSON, not Content-Length framing.
         let handler = BridgeHandler::new();
         let service = handler.serve(stdio()).await?;
         // Wait for client disconnect
         service.waiting().await?;
         Ok(())
+    }
+}
+
+pub mod codex_stdio {
+    use crate::{mcp::ToolExecutor, server};
+    use anyhow::{anyhow, Context, Result};
+    use serde_json::{json, Map, Value};
+    use tokio::io::{
+        AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+    };
+    use tracing::{debug, info};
+
+    struct ServerState {
+        shutdown_requested: bool,
+    }
+
+    impl ServerState {
+        fn new() -> Self {
+            Self {
+                shutdown_requested: false,
+            }
+        }
+    }
+
+    pub async fn run_stdio_server() -> Result<()> {
+        crate::logging::init_tracing();
+        info!("starting MCP stdio server (content-length)");
+
+        let handler = ToolExecutor::from_env();
+        run_over(tokio::io::stdin(), tokio::io::stdout(), handler).await
+    }
+
+    async fn run_over<R, W>(reader: R, mut writer: W, handler: ToolExecutor) -> Result<()>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        let mut reader = BufReader::new(reader);
+        let mut state = ServerState::new();
+
+        loop {
+            let message = match read_message(&mut reader).await? {
+                Some(message) => message,
+                None => break,
+            };
+
+            if let Some(response) = handle_message(&handler, &mut state, message).await {
+                write_message(&mut writer, &response).await?;
+            }
+
+            if state.shutdown_requested {
+                break;
+            }
+        }
+
+        writer.flush().await?;
+        Ok(())
+    }
+
+    async fn read_message<R>(reader: &mut BufReader<R>) -> Result<Option<Value>>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let mut content_length = None;
+
+        loop {
+            let mut line = String::new();
+            let read = reader
+                .read_line(&mut line)
+                .await
+                .context("failed to read MCP header line")?;
+
+            if read == 0 {
+                if content_length.is_none() {
+                    return Ok(None);
+                }
+                return Err(anyhow!("unexpected EOF while reading MCP headers"));
+            }
+
+            if line == "\r\n" {
+                break;
+            }
+
+            let (name, value) = line
+                .split_once(':')
+                .ok_or_else(|| anyhow!("invalid MCP header: {line:?}"))?;
+
+            if name.eq_ignore_ascii_case("content-length") {
+                let parsed = value
+                    .trim()
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid Content-Length header: {value:?}"))?;
+                content_length = Some(parsed);
+            }
+        }
+
+        let len = content_length.ok_or_else(|| anyhow!("missing Content-Length header"))?;
+        let mut body = vec![0; len];
+        reader
+            .read_exact(&mut body)
+            .await
+            .context("failed to read MCP message body")?;
+
+        let value =
+            serde_json::from_slice(&body).context("failed to parse MCP JSON message body")?;
+        Ok(Some(value))
+    }
+
+    async fn write_message<W>(writer: &mut W, message: &Value) -> Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let body = serde_json::to_vec(message).context("failed to encode MCP response")?;
+        let header = format!("Content-Length: {}\r\n\r\n", body.len());
+        writer
+            .write_all(header.as_bytes())
+            .await
+            .context("failed to write MCP response header")?;
+        writer
+            .write_all(&body)
+            .await
+            .context("failed to write MCP response body")?;
+        writer
+            .flush()
+            .await
+            .context("failed to flush MCP response")?;
+        Ok(())
+    }
+
+    async fn handle_message(
+        handler: &ToolExecutor,
+        state: &mut ServerState,
+        message: Value,
+    ) -> Option<Value> {
+        let id = message.get("id").cloned();
+        let method = message.get("method").and_then(Value::as_str)?;
+        let params = message
+            .get("params")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+
+        debug!(%method, "received MCP message");
+
+        match method {
+            "initialize" => id.map(|id| ok_response(id, initialize_result(&params))),
+            "notifications/initialized" | "notifications/cancelled" => None,
+            "ping" => id.map(|id| ok_response(id, json!({}))),
+            "tools/list" => id.map(|id| ok_response(id, list_tools_result())),
+            "tools/call" => {
+                let id = id?;
+                let result = call_tool_result(handler, params).await;
+                Some(match result {
+                    Ok(result) => ok_response(id, result),
+                    Err(err) => {
+                        error_response(id, -32602, format!("invalid tools/call request: {err}"))
+                    }
+                })
+            }
+            "shutdown" => {
+                state.shutdown_requested = true;
+                id.map(|id| ok_response(id, json!({})))
+            }
+            _ if id.is_some() => {
+                id.map(|id| error_response(id, -32601, format!("method not found: {method}")))
+            }
+            _ => None,
+        }
+    }
+
+    fn initialize_result(params: &Map<String, Value>) -> Value {
+        let protocol_version = params
+            .get("protocolVersion")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("2024-11-05");
+        let server_info = server::server_info();
+
+        json!({
+            "protocolVersion": protocol_version,
+            "capabilities": {
+                "tools": {
+                    "listChanged": false,
+                }
+            },
+            "serverInfo": {
+                "name": server_info.name,
+                "version": server_info.version,
+            },
+            "instructions": server_info.instructions,
+        })
+    }
+
+    fn list_tools_result() -> Value {
+        let tools = server::list_tools()
+            .into_iter()
+            .map(|tool| {
+                json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "inputSchema": server::tool_input_schema(tool.name),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        json!({ "tools": tools })
+    }
+
+    async fn call_tool_result(handler: &ToolExecutor, params: Map<String, Value>) -> Result<Value> {
+        let name = params
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("missing string field 'name'"))?;
+        let arguments = params.get("arguments").and_then(Value::as_object).cloned();
+        let output = handler.execute(name, arguments.as_ref()).await;
+
+        Ok(json!({
+            "content": [
+                {
+                    "type": "text",
+                    "text": output.text,
+                }
+            ],
+            "isError": output.is_error,
+        }))
+    }
+
+    fn ok_response(id: Value, result: Value) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result,
+        })
+    }
+
+    fn error_response(id: Value, code: i64, message: String) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": code,
+                "message": message,
+            }
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{initialize_result, list_tools_result};
+        use serde_json::json;
+
+        #[test]
+        fn initialize_reflects_client_protocol_version() {
+            let params = json!({ "protocolVersion": "2024-11-05" });
+            let result = initialize_result(params.as_object().expect("initialize params"));
+            assert_eq!(result["protocolVersion"], "2024-11-05");
+            assert_eq!(result["serverInfo"]["name"], "scylla-rust-mcp");
+            assert_eq!(result["capabilities"]["tools"]["listChanged"], false);
+        }
+
+        #[test]
+        fn tools_list_includes_json_schema() {
+            let result = list_tools_result();
+            let tools = result["tools"].as_array().expect("tools array");
+            assert!(tools.iter().any(|tool| tool["name"] == "list_keyspaces"));
+            let list_tables = tools
+                .iter()
+                .find(|tool| tool["name"] == "list_tables")
+                .expect("list_tables tool");
+            assert_eq!(list_tables["inputSchema"]["required"], json!(["keyspace"]));
+        }
     }
 }
 
