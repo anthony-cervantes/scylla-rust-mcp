@@ -11,3 +11,4 @@
 *.crt
 *.key
 .cargo_home
+.DS_Store

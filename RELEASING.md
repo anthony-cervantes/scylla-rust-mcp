@@ -24,11 +24,30 @@ git push origin vX.Y.Z
 
 3) GitHub Actions publishes artifacts
 - The `Release` workflow runs on tag `v*` and:
-  - Builds multi-arch Docker images
-  - Pushes `ghcr.io/<org>/<repo>:vX.Y.Z` and updates `:latest`
+  - Verifies the tag version matches `Cargo.toml`
+  - Creates a GitHub Release for the tag
+
+4) Publish to crates.io
+- Authenticate locally with a crates.io token:
+
+```bash
+cargo login
+```
+
+- Dry-run the publish first:
+
+```bash
+cargo publish --dry-run
+```
+
+- Publish for real once the package contents look correct:
+
+```bash
+cargo publish
+```
 
 ## Notes
 - Tags are the source of truth; releases are cut from tags.
 - Do not push commits to `main` from Actions; use PRs only.
 - Consider using Conventional Commits in PR titles to make changelog generation easier.
-
+- Crates.io versions are immutable, so double-check `version`, package contents, and README before publishing.

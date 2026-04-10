@@ -51,25 +51,6 @@ run:
   set -euo pipefail
   cargo run
 
-# Docker utilities
-docker-build image='ghcr.io/anthony-cervantes/scylla-rust-mcp:dev':
-  docker build -t "{{image}}" .
-
-docker-run image='ghcr.io/anthony-cervantes/scylla-rust-mcp:dev' uri='host.docker.internal:9042':
-  docker run --rm -i \
-    -e SCYLLA_URI="{{uri}}" \
-    "{{image}}"
-
-docker-run-tls image='ghcr.io/anthony-cervantes/scylla-rust-mcp:dev' uri='scylla.example.com:9142':
-  docker run --rm -i \
-    -e SCYLLA_URI="{{uri}}" \
-    -e SCYLLA_SSL=true \
-    "{{image}}"
-
-docker-run-tls-ca image='ghcr.io/anthony-cervantes/scylla-rust-mcp:dev' uri='scylla.example.com:9142' ca='/absolute/path/ca.pem':
-  docker run --rm -i \
-    -v "{{ca}}:/ca.pem:ro" \
-    -e SCYLLA_URI="{{uri}}" \
-    -e SCYLLA_SSL=true \
-    -e SCYLLA_CA_BUNDLE=/ca.pem \
-    "{{image}}"
+# Install into Cargo's local bin directory
+install:
+  cargo install --path .
