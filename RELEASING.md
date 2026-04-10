@@ -5,6 +5,8 @@ This project uses a tag-driven release process and requires PRs for all changes.
 ## Prerequisites
 - CI must pass on the PR (fmt, clippy, tests).
 - `main` is protected; merge via PR only.
+- The repo secret `CARGO_REGISTRY_TOKEN` must be configured for crates.io publishing.
+- Review [CRATES_IO_CHECKLIST.md](CRATES_IO_CHECKLIST.md) before pushing a tag.
 
 ## Steps
 1) Bump version in Cargo.toml via PR
@@ -25,26 +27,9 @@ git push origin vX.Y.Z
 3) GitHub Actions publishes artifacts
 - The `Release` workflow runs on tag `v*` and:
   - Verifies the tag version matches `Cargo.toml`
-  - Creates a GitHub Release for the tag
-
-4) Publish to crates.io
-- Authenticate locally with a crates.io token:
-
-```bash
-cargo login
-```
-
-- Dry-run the publish first:
-
-```bash
-cargo publish --dry-run
-```
-
-- Publish for real once the package contents look correct:
-
-```bash
-cargo publish
-```
+  - Builds prebuilt Linux, Intel macOS, and Apple Silicon macOS release archives
+  - Publishes the crate to crates.io
+  - Creates a GitHub Release for the tag and uploads the release archives
 
 ## Notes
 - Tags are the source of truth; releases are cut from tags.

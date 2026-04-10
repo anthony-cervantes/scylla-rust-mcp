@@ -13,14 +13,17 @@ permissions:
   contents: write
 
 jobs:
-  create-release:
-    name: Validate tag and create GitHub Release
+  validate-tag:
+    name: Validate release tag
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Validate tag matches Cargo.toml version
+        id: version
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME#v}"
@@ -30,8 +33,118 @@ jobs:
             echo "Tag version ($TAG) does not match Cargo.toml version ($VERSION)"
             exit 1
           fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  build-binaries:
+    name: Build release binaries
+    needs: validate-tag
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset_suffix: x86_64-unknown-linux-gnu
+          - os: macos-13
+            asset_suffix: x86_64-apple-darwin
+          - os: macos-14
+            asset_suffix: aarch64-apple-darwin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Install macOS system dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew install openssl@3 pkg-config
+
+      - name: Set up Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: |
+          set -euo pipefail
+          if [ "${RUNNER_OS}" = "macOS" ]; then
+            export OPENSSL_DIR="$(brew --prefix openssl@3)"
+            export PKG_CONFIG_PATH="${OPENSSL_DIR}/lib/pkgconfig"
+          fi
+          cargo build --release --locked
+
+      - name: Package release archive
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.validate-tag.outputs.version }}"
+          BIN="scylla-rust-mcp"
+          ARCHIVE="${BIN}-v${VERSION}-${{ matrix.asset_suffix }}.tar.gz"
+          STAGE="dist/${BIN}-v${VERSION}-${{ matrix.asset_suffix }}"
+          mkdir -p "$STAGE"
+          cp "target/release/$BIN" "$STAGE/"
+          cp README.md LICENSE-APACHE LICENSE-MIT "$STAGE/"
+          tar -C dist -czf "dist/${ARCHIVE}" "$(basename "$STAGE")"
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256")
+          else
+            (cd dist && shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256")
+          fi
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.asset_suffix }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+  publish-crate:
+    name: Publish crate to crates.io
+    needs:
+      - validate-tag
+      - build-binaries
+    runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Set up Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Ensure crates.io token is configured
+        run: |
+          set -euo pipefail
+          test -n "${CARGO_REGISTRY_TOKEN}"
+
+      - name: Publish to crates.io
+        run: cargo publish --locked
+
+  create-release:
+    name: Create GitHub Release
+    needs:
+      - validate-tag
+      - build-binaries
+      - publish-crate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          files: release-assets/*

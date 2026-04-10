@@ -86,9 +86,10 @@ JSON example:
 
 ## Packaging Notes
 
-- Cargo can install this project directly from Git with `cargo install --git ...`.
+- Once the crate is published, install it with `cargo install scylla-rust-mcp`.
+- Until then, Cargo can install this project directly from Git with `cargo install --git ...`.
 - GitHub Packages is not a Cargo registry, so it is not the right place for `cargo install`.
-- If you want prebuilt native binaries later, GitHub Releases assets are a better fit than GitHub Packages.
+- Tagged releases upload prebuilt Linux, Intel macOS, and Apple Silicon macOS archives to GitHub Releases.
 
 ## Local Development
 
