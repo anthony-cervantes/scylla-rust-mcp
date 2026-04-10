@@ -25,7 +25,12 @@ Supported tools (MCP):
 
 For Codex and other local MCP clients, the simplest path is to run the binary directly.
 
-Install from the Git repository with Cargo:
+Install from crates.io with Cargo:
+```bash
+cargo install scylla-rust-mcp
+```
+
+For unreleased changes, you can still install from Git:
 ```bash
 cargo install --git https://github.com/anthony-cervantes/scylla-rust-mcp scylla-rust-mcp
 ```
