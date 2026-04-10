@@ -15,7 +15,9 @@ version-set version:
   set -euo pipefail
   awk 'BEGIN{v="{{version}}"; inpkg=0; done=0} /^\[package\]/{inpkg=1} /^\[.*\]/{ if ($0 !~ /^\[package\]/) inpkg=0 } inpkg && /^version *= *"/ && !done { sub(/"[0-9]+\.[0-9]+\.[0-9]+"/,"\"" v "\""); done=1 } { print }' Cargo.toml > Cargo.toml.tmp
   mv Cargo.toml.tmp Cargo.toml
+  cargo check
   git add Cargo.toml
+  git add Cargo.lock
   git commit -m "chore(release): bump version to {{version}}"
 
 # Create and push annotated tag `v<version>`; if version omitted, reads Cargo.toml

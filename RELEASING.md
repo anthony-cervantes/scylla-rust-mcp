@@ -11,6 +11,7 @@ This project uses a tag-driven release process and requires PRs for all changes.
 ## Steps
 1) Bump version in Cargo.toml via PR
 - Edit `Cargo.toml` `package.version` to the next SemVer (e.g., `0.1.5`).
+- Update `Cargo.lock` too before merging. Running `cargo check` after the version bump is enough.
 - Optionally update `CHANGELOG.md` if present.
 - Open a PR titled `chore(release): vX.Y.Z` and merge after CI is green.
 

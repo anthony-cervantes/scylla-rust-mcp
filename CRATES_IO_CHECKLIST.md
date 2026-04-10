@@ -4,6 +4,7 @@ Use this before pushing a release tag.
 
 ## Preflight
 - Confirm `Cargo.toml` has the intended `package.version`
+- Confirm `Cargo.lock` matches the same crate version
 - Run `cargo fmt --all`
 - Run `cargo clippy --all-targets -- -D warnings`
 - Run `cargo test`
