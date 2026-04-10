@@ -1,8 +1,13 @@
 [package]
 name = "scylla-rust-mcp"
-version = "0.1.7"
+version = "0.1.12"
 edition = "2021"
 license = "MIT OR Apache-2.0"
+description = "Read-only MCP server for ScyllaDB over stdio"
+readme = "README.md"
+repository = "https://github.com/anthony-cervantes/scylla-rust-mcp"
+keywords = ["mcp", "scylladb", "cassandra", "database", "server"]
+categories = ["database", "command-line-utilities"]
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std"] }
