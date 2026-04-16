@@ -352,6 +352,7 @@ pub mod mcp {
     pub struct ToolExecutor {
         session_state: Arc<SessionState>,
         schema_cache: Arc<RwLock<StdHashMap<(String, String), crate::db::DescribeTable>>>,
+        tool_timeout: std::time::Duration,
     }
 
     impl ToolExecutor {
@@ -359,6 +360,7 @@ pub mod mcp {
             Self {
                 session_state,
                 schema_cache: Arc::new(RwLock::new(StdHashMap::new())),
+                tool_timeout: timeout_from_env("MCP_TOOL_TIMEOUT_MS", 30_000),
             }
         }
 
@@ -369,9 +371,7 @@ pub mod mcp {
         }
 
         pub(crate) fn warmup_connection(&self) {
-            let enabled = std::env::var("SCYLLA_WARMUP_ON_START")
-                .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
-                .unwrap_or(false);
+            let enabled = bool_from_env("SCYLLA_WARMUP_ON_START", true);
             if !enabled {
                 return;
             }
@@ -438,10 +438,16 @@ pub mod mcp {
                     arguments: arguments.cloned(),
                 },
             };
-            let result = self.execute_request(request).await;
-            match result {
-                Ok(output) => output,
-                Err(never) => match never {},
+            match tokio::time::timeout(self.tool_timeout, self.execute_request(request)).await {
+                Ok(result) => match result {
+                    Ok(output) => output,
+                    Err(never) => match never {},
+                },
+                Err(_) => ToolOutput::error(format!(
+                    "tool '{}' timed out after {} ms",
+                    name,
+                    self.tool_timeout.as_millis()
+                )),
             }
         }
 
@@ -1213,6 +1219,7 @@ pub mod mcp {
         uri: String,
         credentials: Option<(String, String)>,
         ssl: Option<SslConfig>,
+        connect_timeout: std::time::Duration,
     }
 
     #[derive(Clone, Debug)]
@@ -1247,6 +1254,7 @@ pub mod mcp {
                 uri,
                 credentials,
                 ssl,
+                connect_timeout: timeout_from_env("SCYLLA_CONNECT_TIMEOUT_MS", 10_000),
             }
         }
     }
@@ -1301,10 +1309,30 @@ pub mod mcp {
             });
             builder = builder.ssl_context(Some(ctx.build()));
         }
-        builder
-            .build()
+        tokio::time::timeout(config.connect_timeout, builder.build())
             .await
+            .with_context(|| {
+                format!(
+                    "timed out connecting to SCYLLA_URI after {} ms",
+                    config.connect_timeout.as_millis()
+                )
+            })?
             .context("failed to connect to SCYLLA_URI")
+    }
+
+    fn bool_from_env(name: &str, default: bool) -> bool {
+        std::env::var(name)
+            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+            .unwrap_or(default)
+    }
+
+    fn timeout_from_env(name: &str, default_ms: u64) -> std::time::Duration {
+        let millis = std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(default_ms);
+        std::time::Duration::from_millis(millis)
     }
 
     #[async_trait::async_trait]
@@ -1501,6 +1529,7 @@ pub mod codex_stdio {
         info!("starting MCP stdio server (content-length)");
 
         let handler = ToolExecutor::from_env();
+        handler.warmup_connection();
         run_over(tokio::io::stdin(), tokio::io::stdout(), handler).await
     }
 
