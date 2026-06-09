@@ -371,7 +371,7 @@ pub mod mcp {
         }
 
         pub(crate) fn warmup_connection(&self) {
-            let enabled = bool_from_env("SCYLLA_WARMUP_ON_START", true);
+            let enabled = bool_from_env("SCYLLA_WARMUP_ON_START", false);
             if !enabled {
                 return;
             }

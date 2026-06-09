@@ -50,6 +50,8 @@ Environment:
 - `RUST_LOG` or `MCP_SERVER_LOG` (optional): enable stderr logging, for example `info` or `debug`. The default stdio server stays quiet unless one of these is set.
 - `MCP_FRAMING` (optional): `content-length` (default) for Codex-compatible MCP stdio framing, or `newline` for the legacy newline-delimited JSON transport (manual testing only)
 - `SCYLLA_WARMUP_ON_START` (optional): set to `1` to eagerly connect to Scylla during startup. Default is off so MCP initialization stays fast and quiet.
+- `SCYLLA_CONNECT_TIMEOUT_MS` (optional): Scylla connection timeout in milliseconds. Default is `10000`.
+- `MCP_TOOL_TIMEOUT_MS` (optional): MCP tool execution timeout in milliseconds. Default is `30000`.
 
 ## Use With MCP Clients
 
