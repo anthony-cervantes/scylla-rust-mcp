@@ -1392,7 +1392,6 @@ pub mod rmcp_server {
     use rmcp::{
         model::*, service::RequestContext, transport::stdio, RoleServer, ServerHandler, ServiceExt,
     };
-    use std::borrow::Cow;
     use std::sync::Arc;
     use tracing::info;
 
@@ -1412,11 +1411,10 @@ pub mod rmcp_server {
     impl ServerHandler for BridgeHandler {
         fn get_info(&self) -> ServerInfo {
             // Enable tools; other capabilities can be enabled later.
-            ServerInfo {
-                instructions: Some("Read-only ScyllaDB access for AI agents".into()),
-                capabilities: ServerCapabilities::builder().enable_tools().build(),
-                ..Default::default()
-            }
+            let mut info = ServerInfo::default();
+            info.instructions = Some("Read-only ScyllaDB access for AI agents".into());
+            info.capabilities = ServerCapabilities::builder().enable_tools().build();
+            info
         }
 
         // List tools using our existing static tool metadata.
@@ -1424,22 +1422,22 @@ pub mod rmcp_server {
         // We can refine schemas as we migrate each tool.
         async fn list_tools(
             &self,
-            _request: Option<PaginatedRequestParam>,
+            _request: Option<PaginatedRequestParams>,
             _ctx: RequestContext<RoleServer>,
         ) -> Result<ListToolsResult, rmcp::ErrorData> {
             let items = server::list_tools()
                 .into_iter()
-                .map(|t| Tool {
-                    name: Cow::Owned(t.name.to_string()),
-                    description: Some(Cow::Owned(t.description.to_string())),
-                    input_schema: Arc::new(
-                        crate::server::tool_input_schema(t.name)
-                            .as_object()
-                            .cloned()
-                            .unwrap_or_default(),
-                    ),
-                    output_schema: None,
-                    annotations: None,
+                .map(|t| {
+                    Tool::new(
+                        t.name.to_string(),
+                        t.description.to_string(),
+                        Arc::new(
+                            crate::server::tool_input_schema(t.name)
+                                .as_object()
+                                .cloned()
+                                .unwrap_or_default(),
+                        ),
+                    )
                 })
                 .collect::<Vec<_>>();
             Ok(ListToolsResult::with_all_items(items))
@@ -1447,7 +1445,7 @@ pub mod rmcp_server {
 
         async fn call_tool(
             &self,
-            request: CallToolRequestParam,
+            request: CallToolRequestParams,
             _ctx: RequestContext<RoleServer>,
         ) -> Result<CallToolResult, rmcp::ErrorData> {
             let output = self
