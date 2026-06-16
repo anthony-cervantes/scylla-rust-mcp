@@ -258,10 +258,13 @@ pub mod logging {
 
 pub mod mcp {
     use anyhow::{Context, Result};
+    use base64::Engine;
     use rust_mcp_sdk::error::SdkResult;
     use std::sync::Arc;
     use tokio::sync::OnceCell;
     use tracing::{error, info};
+
+    const MAX_SERVER_CURSORS: usize = 1024;
 
     pub async fn run_stdio_server() -> SdkResult<()> {
         crate::logging::init_tracing();
@@ -352,7 +355,24 @@ pub mod mcp {
     pub struct ToolExecutor {
         session_state: Arc<SessionState>,
         schema_cache: Arc<RwLock<StdHashMap<(String, String), crate::db::DescribeTable>>>,
+        paging_cursors: Arc<RwLock<StdHashMap<String, StoredPagingCursor>>>,
         tool_timeout: std::time::Duration,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct PagingCursorBinding {
+        keyspace: String,
+        table: String,
+        columns: Vec<String>,
+        page_size: i32,
+        filters_json: Option<String>,
+        order_by: Option<Vec<(String, String)>>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct StoredPagingCursor {
+        binding: PagingCursorBinding,
+        raw_cursor: String,
     }
 
     impl ToolExecutor {
@@ -360,6 +380,7 @@ pub mod mcp {
             Self {
                 session_state,
                 schema_cache: Arc::new(RwLock::new(StdHashMap::new())),
+                paging_cursors: Arc::new(RwLock::new(StdHashMap::new())),
                 tool_timeout: timeout_from_env("MCP_TOOL_TIMEOUT_MS", 30_000),
             }
         }
@@ -425,6 +446,84 @@ pub mod mcp {
             }
             let err = last_err.unwrap_or_else(|| anyhow::anyhow!("unknown schema error"));
             Err(err)
+        }
+
+        fn paging_cursor_binding(
+            keyspace: &str,
+            table: &str,
+            columns: &[String],
+            page_size: i32,
+            filters: Option<&serde_json::Map<String, serde_json::Value>>,
+            order_by: Option<&Vec<(String, String)>>,
+        ) -> Result<PagingCursorBinding> {
+            let filters_json = filters
+                .map(serde_json::to_string)
+                .transpose()
+                .context("failed to encode paging cursor filter binding")?;
+            Ok(PagingCursorBinding {
+                keyspace: keyspace.to_string(),
+                table: table.to_string(),
+                columns: columns.to_vec(),
+                page_size,
+                filters_json,
+                order_by: order_by.cloned(),
+            })
+        }
+
+        async fn store_paging_cursor(
+            &self,
+            binding: PagingCursorBinding,
+            raw_cursor: String,
+        ) -> Result<String> {
+            let mut random = [0_u8; 32];
+            openssl::rand::rand_bytes(&mut random).context("failed to generate cursor token")?;
+            let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random);
+
+            let mut cursors = self.paging_cursors.write().await;
+            if cursors.len() >= MAX_SERVER_CURSORS {
+                if let Some(oldest) = cursors.keys().next().cloned() {
+                    cursors.remove(&oldest);
+                }
+            }
+            cursors.insert(
+                token.clone(),
+                StoredPagingCursor {
+                    binding,
+                    raw_cursor,
+                },
+            );
+            Ok(token)
+        }
+
+        async fn take_paging_cursor(
+            &self,
+            token: &str,
+            binding: &PagingCursorBinding,
+        ) -> Result<String> {
+            let stored = self
+                .paging_cursors
+                .write()
+                .await
+                .remove(token)
+                .ok_or_else(|| anyhow::anyhow!("unknown or expired paging cursor"))?;
+            if stored.binding != *binding {
+                anyhow::bail!("paging cursor does not match the current query");
+            }
+            Ok(stored.raw_cursor)
+        }
+
+        async fn replace_next_cursor(
+            &self,
+            obj: &mut serde_json::Map<String, serde_json::Value>,
+            binding: &PagingCursorBinding,
+        ) -> Result<()> {
+            if let Some(serde_json::Value::String(raw_cursor)) = obj.get("next_cursor").cloned() {
+                let token = self
+                    .store_paging_cursor(binding.clone(), raw_cursor)
+                    .await?;
+                obj.insert("next_cursor".into(), serde_json::Value::String(token));
+            }
+            Ok(())
         }
 
         pub(crate) async fn execute(
@@ -826,6 +925,32 @@ pub mod mcp {
                             })
                             .collect()
                     });
+                    let cursor_binding = match Self::paging_cursor_binding(
+                        &keyspace,
+                        &table,
+                        &columns,
+                        page_size,
+                        filters,
+                        order_tuples.as_ref(),
+                    ) {
+                        Ok(binding) => binding,
+                        Err(err) => {
+                            let msg = format!("paged_select failed: {}", err);
+                            return Ok(ToolOutput::error(msg));
+                        }
+                    };
+                    let cursor_state = match cursor.as_deref() {
+                        Some(token) => {
+                            match self.take_paging_cursor(token, &cursor_binding).await {
+                                Ok(raw_cursor) => Some(raw_cursor),
+                                Err(err) => {
+                                    let msg = format!("invalid cursor: {}", err);
+                                    return Ok(ToolOutput::error(msg));
+                                }
+                            }
+                        }
+                        None => None,
+                    };
                     let span = tracing::info_span!("tool", name = "paged_select", %keyspace, %table, page_size);
                     let _g = span.enter();
                     let session = match self.session().await {
@@ -843,11 +968,17 @@ pub mod mcp {
                         page_size,
                         filters,
                         order_tuples.as_ref(),
-                        cursor.as_deref(),
+                        cursor_state.as_deref(),
                     )
                     .await
                     {
-                        Ok(obj) => {
+                        Ok(mut obj) => {
+                            if let Err(err) =
+                                self.replace_next_cursor(&mut obj, &cursor_binding).await
+                            {
+                                let msg = format!("paged_select failed: {}", err);
+                                return Ok(ToolOutput::error(msg));
+                            }
                             let json = serde_json::to_string(&obj).unwrap_or_else(|_| "{}".into());
                             Ok(ToolOutput::text_content(json, None))
                         }
@@ -1214,6 +1345,61 @@ pub mod mcp {
         }
     }
 
+    #[cfg(test)]
+    mod tests {
+        use super::{SessionConfig, SessionState, ToolExecutor};
+        use std::sync::Arc;
+
+        fn test_executor() -> ToolExecutor {
+            ToolExecutor::new(Arc::new(SessionState::new(SessionConfig {
+                uri: "127.0.0.1:9042".to_string(),
+                credentials: None,
+                ssl: None,
+                connect_timeout: std::time::Duration::from_millis(1),
+            })))
+        }
+
+        #[tokio::test]
+        async fn paging_cursor_tokens_are_opaque_one_time_and_query_bound() {
+            let executor = test_executor();
+            let columns = vec!["id".to_string()];
+            let binding =
+                ToolExecutor::paging_cursor_binding("ks", "tbl", &columns, 100, None, None)
+                    .expect("binding should encode");
+            let token = executor
+                .store_paging_cursor(binding.clone(), "raw-scylla-state".to_string())
+                .await
+                .expect("token should store");
+
+            assert_ne!(token, "raw-scylla-state");
+
+            let wrong_binding =
+                ToolExecutor::paging_cursor_binding("ks", "tbl", &columns, 50, None, None)
+                    .expect("binding should encode");
+            let err = executor
+                .take_paging_cursor(&token, &wrong_binding)
+                .await
+                .expect_err("cursor should be bound to page size and query shape");
+            assert!(err.to_string().contains("does not match"));
+
+            let token = executor
+                .store_paging_cursor(binding.clone(), "raw-scylla-state".to_string())
+                .await
+                .expect("token should store");
+            let raw = executor
+                .take_paging_cursor(&token, &binding)
+                .await
+                .expect("matching binding should resolve cursor");
+            assert_eq!(raw, "raw-scylla-state");
+
+            let replay = executor
+                .take_paging_cursor(&token, &binding)
+                .await
+                .expect_err("cursor tokens should be one-time use");
+            assert!(replay.to_string().contains("unknown or expired"));
+        }
+    }
+
     #[derive(Clone, Debug)]
     struct SessionConfig {
         uri: String,
@@ -1510,6 +1696,8 @@ pub mod codex_stdio {
     };
     use tracing::{debug, info};
 
+    const MAX_MCP_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+
     struct ServerState {
         shutdown_requested: bool,
     }
@@ -1591,6 +1779,12 @@ pub mod codex_stdio {
                     .trim()
                     .parse::<usize>()
                     .with_context(|| format!("invalid Content-Length header: {value:?}"))?;
+                if parsed > MAX_MCP_MESSAGE_BYTES {
+                    return Err(anyhow!(
+                        "MCP message body exceeds maximum Content-Length of {} bytes",
+                        MAX_MCP_MESSAGE_BYTES
+                    ));
+                }
                 content_length = Some(parsed);
             }
         }
@@ -1747,8 +1941,9 @@ pub mod codex_stdio {
 
     #[cfg(test)]
     mod tests {
-        use super::{initialize_result, list_tools_result};
+        use super::{initialize_result, list_tools_result, read_message, MAX_MCP_MESSAGE_BYTES};
         use serde_json::json;
+        use tokio::io::BufReader;
 
         #[test]
         fn initialize_reflects_client_protocol_version() {
@@ -1770,6 +1965,16 @@ pub mod codex_stdio {
                 .expect("list_tables tool");
             assert_eq!(list_tables["inputSchema"]["required"], json!(["keyspace"]));
         }
+
+        #[tokio::test]
+        async fn read_message_rejects_oversized_content_length() {
+            let input = format!("Content-Length: {}\r\n\r\n", MAX_MCP_MESSAGE_BYTES + 1);
+            let mut reader = BufReader::new(input.as_bytes());
+            let err = read_message(&mut reader)
+                .await
+                .expect_err("oversized message should be rejected before allocation");
+            assert!(err.to_string().contains("maximum Content-Length"));
+        }
     }
 }
 
@@ -1785,6 +1990,10 @@ pub mod db {
     use serde_json::{Map, Value};
     use std::env;
     use tracing::info;
+
+    const MAX_PAGING_CURSOR_BYTES: usize = 16 * 1024;
+    const MAX_SEARCH_SCHEMA_PATTERN_BYTES: usize = 128;
+    const MAX_SEARCH_SCHEMA_RESULTS: usize = 500;
 
     pub async fn list_keyspaces() -> Result<Vec<String>> {
         let uri = env::var("SCYLLA_URI").unwrap_or_else(|_| "127.0.0.1:9042".to_string());
@@ -2031,10 +2240,7 @@ pub mod db {
         info!(%uri, %keyspace, %table, %limit, "sample rows");
         let session = SessionBuilder::new().known_node(uri).build().await?;
         let (where_clause, bind_values) = build_filters_clause_prepared(filters)?;
-        let cql = format!(
-            "SELECT * FROM {}.{}{} LIMIT {}",
-            keyspace, table, where_clause, limit
-        );
+        let cql = build_select_all_query(keyspace, table, &where_clause, limit)?;
         let prepared = session.prepare(cql).await?;
         let result = session.execute_unpaged(&prepared, &bind_values[..]).await?;
         let specs = result.col_specs().to_owned();
@@ -2064,10 +2270,7 @@ pub mod db {
         filters: Option<&Map<String, Value>>,
     ) -> Result<Vec<Map<String, Value>>> {
         let (where_clause, bind_values) = build_filters_clause_prepared(filters)?;
-        let cql = format!(
-            "SELECT * FROM {}.{}{} LIMIT {}",
-            keyspace, table, where_clause, limit
-        );
+        let cql = build_select_all_query(keyspace, table, &where_clause, limit)?;
         let prepared = session.prepare(cql).await?;
         let result = session.execute_unpaged(&prepared, &bind_values[..]).await?;
         let specs = result.col_specs().to_owned();
@@ -2101,6 +2304,78 @@ pub mod db {
             return false;
         }
         bytes.iter().all(|&c| is_alnum(c))
+    }
+
+    fn table_ref(keyspace: &str, table: &str) -> Result<String> {
+        if !sanitize_ident(keyspace) {
+            anyhow::bail!("invalid keyspace identifier");
+        }
+        if !sanitize_ident(table) {
+            anyhow::bail!("invalid table identifier");
+        }
+        Ok(format!("{}.{}", keyspace, table))
+    }
+
+    fn build_select_all_query(
+        keyspace: &str,
+        table: &str,
+        where_clause: &str,
+        limit: u32,
+    ) -> Result<String> {
+        Ok(format!(
+            "SELECT * FROM {}{} LIMIT {}",
+            table_ref(keyspace, table)?,
+            where_clause,
+            limit
+        ))
+    }
+
+    fn build_select_columns_query(
+        keyspace: &str,
+        table: &str,
+        col_list: &str,
+        where_clause: &str,
+        order_clause: &str,
+        limit: Option<u32>,
+    ) -> Result<String> {
+        let limit_clause = limit
+            .map(|limit| format!(" LIMIT {}", limit))
+            .unwrap_or_default();
+        Ok(format!(
+            "SELECT {} FROM {}{}{}{}",
+            col_list,
+            table_ref(keyspace, table)?,
+            where_clause,
+            order_clause,
+            limit_clause
+        ))
+    }
+
+    fn decode_paging_cursor(token: &str) -> Result<Vec<u8>> {
+        let max_encoded = MAX_PAGING_CURSOR_BYTES.div_ceil(3) * 4;
+        if token.len() > max_encoded {
+            anyhow::bail!("paging cursor is too large");
+        }
+        let bytes = base64::engine::general_purpose::STANDARD.decode(token.as_bytes())?;
+        if bytes.len() > MAX_PAGING_CURSOR_BYTES {
+            anyhow::bail!("paging cursor is too large");
+        }
+        Ok(bytes)
+    }
+
+    fn validate_search_schema_pattern(pattern: &str) -> Result<()> {
+        if pattern.trim().is_empty() {
+            anyhow::bail!("search pattern must not be empty");
+        }
+        if pattern.len() > MAX_SEARCH_SCHEMA_PATTERN_BYTES {
+            anyhow::bail!("search pattern is too large");
+        }
+        Ok(())
+    }
+
+    fn push_schema_result(out: &mut Vec<Map<String, Value>>, item: Map<String, Value>) -> bool {
+        out.push(item);
+        out.len() < MAX_SEARCH_SCHEMA_RESULTS
     }
 
     fn build_filters_clause_prepared(
@@ -2161,10 +2436,14 @@ pub mod db {
         let session = SessionBuilder::new().known_node(uri).build().await?;
         let (where_clause, bind_values) = build_filters_clause_prepared(filters)?;
         let order_clause = build_order_by_clause(order_by)?;
-        let cql = format!(
-            "SELECT {} FROM {}.{}{}{} LIMIT {}",
-            col_list, keyspace, table, where_clause, order_clause, limit
-        );
+        let cql = build_select_columns_query(
+            keyspace,
+            table,
+            &col_list,
+            &where_clause,
+            &order_clause,
+            Some(limit),
+        )?;
         let prepared = session.prepare(cql).await?;
         let result = session.execute_unpaged(&prepared, &bind_values[..]).await?;
         let specs = result.col_specs().to_owned();
@@ -2206,10 +2485,14 @@ pub mod db {
         let col_list = columns.join(", ");
         let (where_clause, bind_values) = build_filters_clause_prepared(filters)?;
         let order_clause = build_order_by_clause(order_by)?;
-        let cql = format!(
-            "SELECT {} FROM {}.{}{}{} LIMIT {}",
-            col_list, keyspace, table, where_clause, order_clause, limit
-        );
+        let cql = build_select_columns_query(
+            keyspace,
+            table,
+            &col_list,
+            &where_clause,
+            &order_clause,
+            Some(limit),
+        )?;
         let prepared = session.prepare(cql).await?;
         let result = session.execute_unpaged(&prepared, &bind_values[..]).await?;
         let specs = result.col_specs().to_owned();
@@ -2280,10 +2563,7 @@ pub mod db {
             };
             bind_values.push(cv);
         }
-        let cql = format!(
-            "SELECT * FROM {}.{}{} LIMIT {}",
-            keyspace, table, where_clause, limit
-        );
+        let cql = build_select_all_query(keyspace, table, &where_clause, limit)?;
         let prepared = session.prepare(cql).await?;
         let result = session.execute_unpaged(&prepared, &bind_values[..]).await?;
         let specs = result.col_specs().to_owned();
@@ -2340,16 +2620,20 @@ pub mod db {
         let col_list = columns.join(", ");
         let (where_clause, bind_values) = build_filters_clause_prepared(filters)?;
         let order_clause = build_order_by_clause(order_by)?;
-        let cql = format!(
-            "SELECT {} FROM {}.{}{}{}",
-            col_list, keyspace, table, where_clause, order_clause
-        );
+        let cql = build_select_columns_query(
+            keyspace,
+            table,
+            &col_list,
+            &where_clause,
+            &order_clause,
+            None,
+        )?;
         let prepared = session
             .prepare(Query::new(cql).with_page_size(page_size))
             .await?;
         let paging_state = match cursor {
             Some(tok) => {
-                let bytes = base64::engine::general_purpose::STANDARD.decode(tok.as_bytes())?;
+                let bytes = decode_paging_cursor(tok)?;
                 PagingState::new_from_raw_bytes(bytes)
             }
             None => PagingState::start(),
@@ -2708,6 +2992,7 @@ pub mod db {
         pattern: &str,
         keyspace: Option<&str>,
     ) -> Result<Vec<Map<String, Value>>> {
+        validate_search_schema_pattern(pattern)?;
         let pat_lower = pattern.to_lowercase();
         // Helper to check if s contains pattern (case-insensitive)
         let contains = |s: &str| s.to_lowercase().contains(&pat_lower);
@@ -2731,7 +3016,9 @@ pub mod db {
                 m.insert("kind".into(), Value::String("table".into()));
                 m.insert("keyspace".into(), Value::String(ks));
                 m.insert("name".into(), Value::String(tb));
-                out.push(m);
+                if !push_schema_result(&mut out, m) {
+                    return Ok(out);
+                }
             }
         }
 
@@ -2754,7 +3041,9 @@ pub mod db {
                 m.insert("keyspace".into(), Value::String(ks));
                 m.insert("table".into(), Value::String(tb));
                 m.insert("name".into(), Value::String(col));
-                out.push(m);
+                if !push_schema_result(&mut out, m) {
+                    return Ok(out);
+                }
             }
         }
 
@@ -2776,7 +3065,9 @@ pub mod db {
                 m.insert("kind".into(), Value::String("udt".into()));
                 m.insert("keyspace".into(), Value::String(ks));
                 m.insert("name".into(), Value::String(ty));
-                out.push(m);
+                if !push_schema_result(&mut out, m) {
+                    return Ok(out);
+                }
             }
         }
 
@@ -2798,7 +3089,9 @@ pub mod db {
                 m.insert("kind".into(), Value::String("view".into()));
                 m.insert("keyspace".into(), Value::String(ks));
                 m.insert("name".into(), Value::String(v));
-                out.push(m);
+                if !push_schema_result(&mut out, m) {
+                    return Ok(out);
+                }
             }
         }
 
@@ -2820,7 +3113,9 @@ pub mod db {
                 m.insert("kind".into(), Value::String("function".into()));
                 m.insert("keyspace".into(), Value::String(ks));
                 m.insert("name".into(), Value::String(f));
-                out.push(m);
+                if !push_schema_result(&mut out, m) {
+                    return Ok(out);
+                }
             }
         }
 
@@ -2842,7 +3137,9 @@ pub mod db {
                 m.insert("kind".into(), Value::String("aggregate".into()));
                 m.insert("keyspace".into(), Value::String(ks));
                 m.insert("name".into(), Value::String(a));
-                out.push(m);
+                if !push_schema_result(&mut out, m) {
+                    return Ok(out);
+                }
             }
         }
 
@@ -2860,5 +3157,77 @@ pub mod db {
         let uri = env::var("SCYLLA_URI").unwrap_or_else(|_| "127.0.0.1:9042".to_string());
         let session = SessionBuilder::new().known_node(uri).build().await?;
         list_udts_with(&session, keyspace).await
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{
+            build_select_all_query, build_select_columns_query, decode_paging_cursor,
+            push_schema_result, validate_search_schema_pattern, MAX_PAGING_CURSOR_BYTES,
+            MAX_SEARCH_SCHEMA_PATTERN_BYTES, MAX_SEARCH_SCHEMA_RESULTS,
+        };
+        use base64::Engine;
+        use serde_json::{Map, Value};
+
+        #[test]
+        fn table_ref_rejects_cql_identifier_injection() {
+            let err = build_select_all_query("ks; DROP KEYSPACE prod", "users", "", 10)
+                .expect_err("keyspace syntax should not be interpolated into CQL");
+            assert!(err.to_string().contains("invalid keyspace identifier"));
+
+            let err =
+                build_select_columns_query("ks", "users WHERE id = 1", "id", "", "", Some(10))
+                    .expect_err("table syntax should not be interpolated into CQL");
+            assert!(err.to_string().contains("invalid table identifier"));
+        }
+
+        #[test]
+        fn query_builders_accept_plain_identifiers() {
+            let select_all = build_select_all_query("ks_1", "users_2", " WHERE id = ?", 25)
+                .expect("valid identifiers should build");
+            assert_eq!(
+                select_all,
+                "SELECT * FROM ks_1.users_2 WHERE id = ? LIMIT 25"
+            );
+
+            let select_cols =
+                build_select_columns_query("ks", "users", "id, name", "", " ORDER BY id ASC", None)
+                    .expect("valid identifiers should build");
+            assert_eq!(select_cols, "SELECT id, name FROM ks.users ORDER BY id ASC");
+        }
+
+        #[test]
+        fn paging_cursor_rejects_oversized_tokens() {
+            let bytes = vec![0_u8; MAX_PAGING_CURSOR_BYTES + 1];
+            let token = base64::engine::general_purpose::STANDARD.encode(bytes);
+            let err =
+                decode_paging_cursor(&token).expect_err("oversized cursor should be rejected");
+            assert!(err.to_string().contains("too large"));
+        }
+
+        #[test]
+        fn search_schema_rejects_empty_or_oversized_patterns() {
+            let err = validate_search_schema_pattern("   ")
+                .expect_err("blank patterns should not scan the whole schema");
+            assert!(err.to_string().contains("must not be empty"));
+
+            let pattern = "a".repeat(MAX_SEARCH_SCHEMA_PATTERN_BYTES + 1);
+            let err = validate_search_schema_pattern(&pattern)
+                .expect_err("oversized patterns should be rejected");
+            assert!(err.to_string().contains("too large"));
+        }
+
+        #[test]
+        fn search_schema_result_limit_stops_at_cap() {
+            let mut out = Vec::new();
+            for _ in 0..(MAX_SEARCH_SCHEMA_RESULTS - 1) {
+                assert!(push_schema_result(&mut out, Map::new()));
+            }
+
+            let mut last = Map::new();
+            last.insert("kind".to_string(), Value::String("last".to_string()));
+            assert!(!push_schema_result(&mut out, last));
+            assert_eq!(out.len(), MAX_SEARCH_SCHEMA_RESULTS);
+        }
     }
 }
